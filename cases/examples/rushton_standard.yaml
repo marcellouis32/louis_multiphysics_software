@@ -1,0 +1,68 @@
+schema_version: 0.1.0
+name: rushton_standard_lab
+description: >
+  Standard baffled tank with a single 6-blade Rushton turbine (T = H, D = T/3, C = T/3).
+  Primary V&V case: computed power number must land in 4.8-5.5.
+tags: [validation, power_number, rushton]
+
+geometry:
+  vessel:
+    diameter_m: 0.30
+    liquid_level_m: 0.30
+    bottom: flat
+  impellers:
+    - type: rushton_6blade
+      diameter_m: 0.10
+      clearance_m: 0.10
+      speed_rpm: 300
+      blade_width_m: 0.020
+      n_blades: 6
+  baffles:
+    count: 4
+    width_ratio: 0.1
+    wall_offset_ratio: 0.02
+    thickness_m: 0.003
+
+fluid:
+  model: newtonian
+  density_kg_m3: 998.0
+  viscosity_pa_s: 0.001
+
+physics:
+  momentum:
+    engine: lbm
+    collision: mrt
+    turbulence:
+      model: les_smagorinsky
+      smagorinsky_constant: 0.1
+  scalars:
+    - name: tracer
+      schmidt_number: 1000.0
+      initial_condition: top_patch
+      initial_value: 1.0
+  energy:
+    enabled: false
+
+numerics:
+  cells_across_tank: 128
+  lattice_mach: 0.05
+  duration_s: 20.0
+  precision: fp32
+
+outputs:
+  quantities:
+    - power_number
+    - power_per_volume
+    - blend_time_95
+    - tip_speed
+    - energy_dissipation_max
+    - shear_stress_max
+  fields:
+    enabled: true
+    interval_s: 0.5
+    variables: [velocity, pressure, tracer]
+    canonical_resolution: 64
+
+run:
+  device: cuda:0
+  seed: 0
