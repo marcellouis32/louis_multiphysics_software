@@ -17,6 +17,7 @@ from scipy.ndimage import map_coordinates
 from lms.viz.style import (
     ACCENT,
     ACCENT_WARM,
+    BACKGROUND,
     DIVERGING_DARK,
     FLOW,
     MUTED,
@@ -261,6 +262,184 @@ def plot_convergence(residuals, save: str | Path | None = None):
         ax.set_xlabel("timestep")
         ax.set_ylabel("relative change in |u|")
         ax.set_title("Convergence to steady state")
+        if save:
+            fig.savefig(save)
+        return fig
+
+
+def _levels_from_norm(norm, count: int) -> np.ndarray:
+    """Contour levels spaced evenly in *colour* space rather than data space, so a
+    nonlinear norm (power, asinh) puts its resolution where the structure is."""
+    levels = np.asarray(norm.inverse(np.linspace(0.0, 1.0, count + 1)), dtype=float)
+    levels = np.unique(levels[np.isfinite(levels)])
+    return levels
+
+
+def plot_contours(
+    field: np.ndarray,
+    label: str,
+    title: str = "",
+    subtitle: str = "",
+    cmap=FLOW,
+    norm=None,
+    n_filled: int = 28,
+    n_lines: int = 14,
+    solid: np.ndarray | None = None,
+    extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+    save: str | Path | None = None,
+):
+    """Filled contours with overlaid isolines - the conventional CFD deliverable.
+
+    Complements the LIC renderer rather than replacing it: contours give readable
+    quantitative levels, LIC gives continuous structure.
+    """
+    mask = solid.astype(bool) if solid is not None else None
+    data = np.ma.masked_where(mask, field) if mask is not None else np.ma.asarray(field)
+    if norm is None:
+        norm = PowerNorm(gamma=1.0, vmin=float(data.min()), vmax=float(data.max()))
+
+    filled = _levels_from_norm(norm, n_filled)
+    lines = _levels_from_norm(norm, n_lines)
+
+    ny, nx = field.shape
+    xs = np.linspace(extent[0], extent[1], nx)
+    ys = np.linspace(extent[2], extent[3], ny)
+
+    with house_style():
+        fig, ax = plt.subplots(figsize=(6.6, 6.0))
+        cf = ax.contourf(xs, ys, data, levels=filled, cmap=cmap, norm=norm, extend="both")
+        # Kills the hairline seams contourf leaves between bands. ContourSet became a
+        # Collection in matplotlib 3.8; .collections was removed in 3.10.
+        if hasattr(cf, "set_edgecolor"):
+            cf.set_edgecolor("face")
+        else:
+            for c in cf.collections:
+                c.set_edgecolor("face")
+        ax.contour(xs, ys, data, levels=lines, colors="white", linewidths=0.45, alpha=0.32)
+
+        colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax, label)
+        ax.set_title(title)
+        if subtitle:
+            annotate(ax, subtitle, "lower left")
+        ax.set_xlabel("$x\\,/\\,L$")
+        ax.set_ylabel("$y\\,/\\,L$")
+        ax.set_aspect("equal")
+        ax.grid(False)
+        if save:
+            fig.savefig(save)
+        return fig
+
+
+def plot_streamfunction(
+    psi: np.ndarray,
+    title: str = "Stream function",
+    subtitle: str = "",
+    solid: np.ndarray | None = None,
+    extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+    markers: dict[str, tuple[float, float]] | None = None,
+    save: str | Path | None = None,
+):
+    """Iso-contours of psi are exact streamlines.
+
+    Levels are split between the primary circulation and the much weaker corner
+    vortices; a single linear set would render the corner eddies as blank space,
+    which is precisely where the interesting recirculation lives.
+    """
+    mask = solid.astype(bool) if solid is not None else None
+    data = np.ma.masked_where(mask, psi) if mask is not None else np.ma.asarray(psi)
+    lo, hi = float(data.min()), float(data.max())
+
+    strong = np.linspace(lo, 0.0, 16)[:-1]
+    weak = np.sign(hi) * np.geomspace(max(abs(hi), 1e-12) * 1e-3, max(abs(hi), 1e-12), 8)
+    levels = np.unique(np.concatenate([strong, [0.0], weak]))
+
+    ny, nx = psi.shape
+    xs = np.linspace(extent[0], extent[1], nx)
+    ys = np.linspace(extent[2], extent[3], ny)
+
+    with house_style():
+        fig, ax = plt.subplots(figsize=(6.6, 6.0))
+        ax.contourf(xs, ys, data, levels=40, cmap=FLOW, alpha=0.85)
+        ax.contour(xs, ys, data, levels=levels, colors=ACCENT, linewidths=0.7, alpha=0.9)
+
+        if markers:
+            for name, (mx, my) in markers.items():
+                style = dict(marker="+", ms=13, mew=2.0)
+                colour = ACCENT_WARM if "Ghia" in name else "white"
+                if "Ghia" in name:
+                    style = dict(marker="o", ms=11, mew=1.8, mfc="none")
+                ax.plot(mx, my, color=colour, linestyle="none", label=name, **style)
+            ax.legend(loc="upper left", labelcolor=MUTED)
+
+        ax.set_title(title)
+        if subtitle:
+            annotate(ax, subtitle, "lower right")
+        ax.set_xlabel("$x\\,/\\,L$")
+        ax.set_ylabel("$y\\,/\\,L$")
+        ax.set_aspect("equal")
+        ax.grid(False)
+        if save:
+            fig.savefig(save)
+        return fig
+
+
+def plot_order_of_accuracy(
+    ladders: dict,
+    title: str = "Order of accuracy",
+    subtitle: str = "",
+    save: str | Path | None = None,
+):
+    """Log-log error against resolution, with a fitted slope per refinement ladder.
+
+    `ladders` maps a label to (sizes, errors, fitted_order). The reference triangles
+    are drawn at the fitted slope rather than at an idealised 1 or 2, because the
+    honest question is what the solver actually achieved, not what it should have.
+    """
+    with house_style():
+        fig, ax = plt.subplots(figsize=(7.0, 5.0))
+        colours = [ACCENT, ACCENT_WARM]
+
+        for (label, (sizes, errors, order)), colour in zip(ladders.items(), colours):
+            sizes = np.asarray(sizes, dtype=float)
+            errors = np.asarray(errors, dtype=float)
+            ax.loglog(
+                sizes, errors, "o-", color=colour, linewidth=1.6, markersize=6.5,
+                markerfacecolor=BACKGROUND, markeredgewidth=1.6,
+                label=f"{label}   (slope {order:.2f})",
+            )
+
+        # Second-order guide, anchored just under the coarsest point of the first
+        # ladder so the eye can compare slopes directly instead of across the axes.
+        all_sizes = np.array(
+            sorted({s for sizes, _, _ in ladders.values() for s in sizes}), dtype=float
+        )
+        first_sizes, first_errors, _ = next(iter(ladders.values()))
+        anchor = np.asarray(first_errors, dtype=float)[np.argmin(first_sizes)] * 0.45
+        guide = anchor * (all_sizes[0] / all_sizes) ** 2
+        ax.loglog(all_sizes, guide, "--", color=MUTED, linewidth=1.1, alpha=0.75)
+        mid = len(all_sizes) // 2
+        ax.annotate(
+            r"slope $-2$",
+            xy=(all_sizes[mid], guide[mid]),
+            xytext=(6, -14),
+            textcoords="offset points",
+            color=MUTED,
+            fontsize=9,
+        )
+
+        ax.set_xlabel("lattice resolution  $n$")
+        ax.set_ylabel(r"relative $L_2$ velocity error")
+        ax.set_xticks(all_sizes)
+        ax.set_xticklabels([f"{int(s)}" for s in all_sizes])
+        ax.minorticks_off()
+        ax.legend(loc="lower left", framealpha=0.0)
+        ax.set_title(title, loc="left", pad=14)
+        if subtitle:
+            ax.text(
+                0.0, 1.015, subtitle, transform=ax.transAxes,
+                fontsize=9, color=MUTED, ha="left", va="bottom",
+            )
+        fig.tight_layout()
         if save:
             fig.savefig(save)
         return fig

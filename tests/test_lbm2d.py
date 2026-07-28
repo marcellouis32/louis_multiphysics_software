@@ -12,8 +12,14 @@ from lms.lbm.d2q9 import (
     trt_magic_omega,
     viscosity_to_omega,
 )
-from lms.lbm.solver2d import D2Q9Solver, cavity_centerlines, lid_driven_cavity
-from lms.validation import ghia
+from lms.lbm.solver2d import (
+    D2Q9Solver,
+    cavity_centerlines,
+    lid_driven_cavity,
+    stream_function,
+    vortex_centre,
+)
+from lms.validation import ghia, taylor_green
 
 
 class TestLattice:
@@ -111,6 +117,111 @@ class TestSolver:
         solver.f = equilibrium(solver.rho, solver.ux, solver.uy)
         with pytest.raises(FloatingPointError, match="lattice velocity"):
             solver.run(max_steps=20_000, check_every=100)
+
+
+class TestStreamFunction:
+    @staticmethod
+    def analytic(n: int):
+        """psi = sin(pi x) sin(pi y) on a unit square, expressed in index space,
+        with the velocity field derived from it exactly."""
+        j, i = np.mgrid[0:n, 0:n].astype(float)
+        k = np.pi / (n - 1)
+        psi = np.sin(k * i) * np.sin(k * j)
+        ux = k * np.sin(k * i) * np.cos(k * j)
+        uy = -k * np.cos(k * i) * np.sin(k * j)
+        return psi, ux, uy
+
+    def test_recovers_analytic_stream_function(self):
+        psi_exact, ux, uy = self.analytic(64)
+        psi = stream_function(ux, uy)
+        assert np.abs(psi - psi_exact).max() < 2e-3
+
+    def test_is_second_order_accurate(self):
+        errors = []
+        for n in (32, 64, 128):
+            psi_exact, ux, uy = self.analytic(n)
+            errors.append(np.abs(stream_function(ux, uy) - psi_exact).max())
+        order = np.log2(errors[0] / errors[1])
+        assert 1.7 < order < 2.3, f"trapezoid integration should be 2nd order, got {order:.2f}"
+
+    def test_constant_flow_gives_linear_stream_function(self):
+        n = 16
+        ux = np.ones((n, n))
+        uy = np.zeros((n, n))
+        psi = stream_function(ux, uy)
+        assert psi[:, 0] == pytest.approx(np.arange(n, dtype=float))
+
+    def test_vortex_centre_finds_the_extremum(self):
+        n = 32
+        j, i = np.mgrid[0:n, 0:n].astype(float)
+        psi = (i - 8.0) ** 2 + (j - 20.0) ** 2
+        x, y, value = vortex_centre(psi)
+        assert x == pytest.approx((8 + 0.5) / n)
+        assert y == pytest.approx((20 + 0.5) / n)
+        assert value == pytest.approx(0.0)
+
+
+class TestTaylorGreen:
+    """Order of accuracy against a closed-form solution.
+
+    The cavity can only ever be checked against Ghia's 1982 129^2 result, which has
+    its own error bar. Taylor-Green is exact, so these are the tests that would catch
+    a subtly wrong collision operator -- one that still converges, still conserves
+    mass, still matches Ghia to 1%, but at first order instead of second.
+    """
+
+    SIZES = (16, 32, 64)
+
+    def test_analytic_field_is_divergence_free(self):
+        """Periodic central differences, not np.gradient: the one-sided stencils
+        np.gradient uses at the array edge are wrong for a periodic field and would
+        report a spurious divergence there."""
+        n = 64
+        ux, uy, _ = taylor_green.analytic(n, u0=0.05, nu=0.01, t=0.0)
+        dux_dx = 0.5 * (np.roll(ux, -1, axis=1) - np.roll(ux, 1, axis=1))
+        duy_dy = 0.5 * (np.roll(uy, -1, axis=0) - np.roll(uy, 1, axis=0))
+        assert np.abs(dux_dx + duy_dy).max() < 1e-15
+
+    def test_analytic_field_decays_at_the_viscous_rate(self):
+        n, nu = 64, 0.01
+        k = 2 * np.pi / n
+        t = 500.0
+        ux0, _, _ = taylor_green.analytic(n, u0=0.05, nu=nu, t=0.0)
+        uxt, _, _ = taylor_green.analytic(n, u0=0.05, nu=nu, t=t)
+        assert np.abs(uxt).max() / np.abs(ux0).max() == pytest.approx(
+            np.exp(-2 * nu * k * k * t)
+        )
+
+    def test_diffusive_scaling_is_second_order(self):
+        results = taylor_green.diffusive_ladder(self.SIZES, steps0=150)
+        order = taylor_green.observed_order(results)
+        assert 1.8 < order < 2.4, f"expected second order under diffusive scaling, got {order:.2f}"
+
+    def test_diffusive_scaling_holds_tau_and_reynolds_fixed(self):
+        """The property that makes the ladder valid: only the mesh changes."""
+        results = taylor_green.diffusive_ladder(self.SIZES, steps0=50)
+        assert len({round(r.nu, 12) for r in results}) == 1
+        assert all(r.reynolds == pytest.approx(results[0].reynolds) for r in results)
+        assert results[-1].mach < results[0].mach / 3
+
+    def test_acoustic_scaling_stalls_on_the_mach_error_floor(self):
+        """Documents the trap rather than the solver.
+
+        Holding lattice velocity fixed leaves the O(Ma^2) compressibility error
+        constant under refinement. Past the point where discretisation error drops
+        below it, refining stops helping -- and on a fine enough grid it actively
+        hurts, because tau grows with n at fixed Re. This is why the cavity study
+        measured order ~1.1 with a solver that is genuinely second order.
+
+        Run at an elevated Mach (u0 = 0.12) so the floor is reachable on grids small
+        enough to keep this in the fast suite. At u0 = 0.05 the same collapse happens,
+        it just takes until n = 128.
+        """
+        results = taylor_green.acoustic_ladder(self.SIZES, u0=0.12, steps0=150)
+        assert len({round(r.mach, 12) for r in results}) == 1
+        order = taylor_green.observed_order(results)
+        assert order < 1.8, f"acoustic scaling should not reach second order, got {order:.2f}"
+        assert results[-1].error > results[-2].error
 
 
 class TestGhiaData:
