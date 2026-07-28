@@ -82,6 +82,32 @@ class TestNorms:
         mask = np.array([False, False, False, True])
         assert signed_asinh_norm(data, mask=mask).vmax < 1.0
 
+    def test_narrow_linear_region_lifts_a_weak_uniform_core_off_the_neutral_colour(self):
+        """The lid-driven cavity failure mode, reduced to its essentials.
+
+        A field where most cells sit at |x| ~ 2 but a thin boundary layer reaches 80.
+        With a wide linear region the core lands almost on the dark centre of a
+        diverging colormap and disappears. Narrowing it must push the core out far
+        enough to take on colour.
+        """
+        # The interior needs a spread, not a single value: percentiles of a delta
+        # are all equal, so the knob would have nothing to grip.
+        interior = -np.linspace(0.05, 4.0, 4000)
+        layer = np.linspace(20.0, 80.0, 200)
+        data = np.concatenate([interior, layer])
+
+        wide = signed_asinh_norm(data, percentile=99.5, linear_percentile=60.0)
+        narrow = signed_asinh_norm(data, percentile=97.0, linear_percentile=20.0)
+
+        def offset(norm):
+            """Distance of the core from the neutral colour, as a fraction of the
+            half-range. Below ~0.2 a dark-centred colormap shows nothing."""
+            return abs(norm(-2.0) - 0.5) / 0.5
+
+        assert offset(narrow) > 1.5 * offset(wide)
+        assert offset(narrow) > 0.3
+        assert narrow.vmax < wide.vmax
+
 
 class TestMask:
     def test_upsample_preserves_coverage_fraction(self):

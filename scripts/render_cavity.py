@@ -58,7 +58,11 @@ def main() -> None:
         title="Lid-driven cavity — vorticity",
         subtitle=subtitle,
         cmap=DIVERGING_DARK,
-        norm=signed_asinh_norm(vort, percentile=99.5),
+        # Clip at the 97th percentile and keep the linear region tight: the lid
+        # boundary layer reaches |omega| ~ 80 but the core rotates at ~2, and it is
+        # the core we came to look at. Costs saturation in ~3% of cells, all of them
+        # inside the wall layers.
+        norm=signed_asinh_norm(vort, percentile=97.0, linear_percentile=20.0),
         save=out / f"contour_vorticity_{tag}.png",
     )
 

@@ -115,7 +115,10 @@ def symmetric_norm(data: np.ndarray, percentile: float = 99.0) -> Normalize:
 
 
 def signed_asinh_norm(
-    data: np.ndarray, mask: np.ndarray | None = None, percentile: float = 99.8
+    data: np.ndarray,
+    mask: np.ndarray | None = None,
+    percentile: float = 99.8,
+    linear_percentile: float = 60.0,
 ) -> AsinhNorm:
     """Symmetric asinh scale for signed fields.
 
@@ -124,13 +127,26 @@ def signed_asinh_norm(
     extremes renders the entire interior as neutral. asinh is linear near zero and
     logarithmic in the tails, so both survive in one image.
 
+    Two knobs, and they do different jobs:
+
+    `percentile` sets the saturation limit. Push it too high and a handful of
+    boundary-layer cells set the scale for the whole image.
+
+    `linear_percentile` sets the width of the linear region around zero, and it is
+    the one that decides whether a *weak but uniform* feature is visible. The
+    lid-driven cavity is the cautionary case: its core rotates as a solid body at
+    |omega| ~ 2 while the lid layer reaches ~80. Leave the linear region wide and
+    that core -- the most physically meaningful structure in the flow -- renders as
+    near-black background on a dark-centred colormap. Narrow it and the core gets
+    colour while the wall layers still resolve in the logarithmic tail.
+
     `mask` marks cells to exclude when choosing the limits (typically solids).
     """
     values = np.abs(np.asarray(data)[~mask] if mask is not None else np.asarray(data))
     values = values[np.isfinite(values)]
     lim = float(np.percentile(values, percentile)) if values.size else 1.0
     lim = lim if lim > 0 else 1.0
-    linear_width = max(float(np.percentile(values, 60.0)), lim * 1e-3)
+    linear_width = max(float(np.percentile(values, linear_percentile)), lim * 1e-3)
     return AsinhNorm(linear_width=linear_width, vmin=-lim, vmax=lim)
 
 
