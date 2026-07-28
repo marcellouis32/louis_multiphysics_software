@@ -26,6 +26,33 @@ from lms.lbm.d2q9 import (
 )
 
 
+def stream_function(ux: np.ndarray, uy: np.ndarray) -> np.ndarray:
+    """Stream function psi, defined by u = dpsi/dy and v = -dpsi/dx.
+
+    Only meaningful for 2D incompressible flow. Integrated from psi = 0 at the
+    origin: along the bottom edge using v, then up each column using u, both with
+    the trapezoid rule. Iso-contours of psi are exact streamlines, which makes this
+    the standard way to locate recirculation zones and compare vortex centres --
+    a scalar check that profiles alone cannot provide, since a solver can match
+    centreline velocities while putting the vortex in the wrong place.
+    """
+    ny, nx = ux.shape
+    psi = np.zeros((ny, nx), dtype=np.float64)
+    psi[0, :] = -np.concatenate([[0.0], np.cumsum(0.5 * (uy[0, 1:] + uy[0, :-1]))])
+    psi[1:, :] = psi[0, :][None, :] + np.cumsum(0.5 * (ux[1:, :] + ux[:-1, :]), axis=0)
+    return psi
+
+
+def vortex_centre(psi: np.ndarray) -> tuple[float, float, float]:
+    """Locate the strongest (most negative) circulation cell.
+
+    Returns normalised (x, y) of the extremum and the psi value there.
+    """
+    idx = np.unravel_index(np.argmin(psi), psi.shape)
+    ny, nx = psi.shape
+    return (idx[1] + 0.5) / nx, (idx[0] + 0.5) / ny, float(psi[idx])
+
+
 @dataclass
 class SolverState:
     ux: np.ndarray
@@ -43,6 +70,9 @@ class SolverState:
         duy_dx = np.gradient(self.uy, axis=1)
         dux_dy = np.gradient(self.ux, axis=0)
         return duy_dx - dux_dy
+
+    def stream_function(self) -> np.ndarray:
+        return stream_function(self.ux, self.uy)
 
 
 class D2Q9Solver:

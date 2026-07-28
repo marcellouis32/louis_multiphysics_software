@@ -78,6 +78,35 @@ def v_profile(reynolds: float) -> tuple[np.ndarray, np.ndarray]:
     return _V_TABLE[:, 0].copy(), _V_TABLE[:, col].copy()
 
 
+# Primary vortex centre (x, y) and the normalised stream function there.
+# A scalar, geometry-level check that complements the centreline RMS: profiles can
+# agree while the recirculation sits in the wrong place.
+PRIMARY_VORTEX = {
+    100: {"centre": (0.6172, 0.7344), "psi": -0.103423},
+    400: {"centre": (0.5547, 0.6055), "psi": -0.113909},
+    1000: {"centre": (0.5313, 0.5625), "psi": -0.117929},
+}
+
+SECONDARY_VORTEX_BR = {
+    100: (0.9453, 0.0625),
+    400: (0.8906, 0.1250),
+    1000: (0.8594, 0.1094),
+}
+
+SECONDARY_VORTEX_BL = {
+    100: (0.0313, 0.0391),
+    400: (0.0508, 0.0469),
+    1000: (0.0859, 0.0781),
+}
+
+
+def primary_vortex(reynolds: float) -> dict:
+    key = int(round(reynolds))
+    if key not in PRIMARY_VORTEX:
+        raise KeyError(f"Ghia data available for Re in {AVAILABLE_REYNOLDS}, not {reynolds}")
+    return PRIMARY_VORTEX[key]
+
+
 def rms_error(
     coord: np.ndarray, values: np.ndarray, ref_coord: np.ndarray, ref_values: np.ndarray
 ) -> float:
