@@ -4,6 +4,7 @@ matplotlib.use("Agg")
 
 import numpy as np
 import pytest
+from matplotlib.colors import PowerNorm
 
 from lms.viz.fields2d import _equalize, _upsample_mask, line_integral_convolution
 from lms.viz.style import house_style, signed_asinh_norm, symmetric_norm
@@ -123,3 +124,91 @@ def test_house_style_restores_global_rc():
     with house_style():
         pass
     assert matplotlib.rcParams["axes.facecolor"] == before
+
+
+class TestContourAnimation:
+    """The GIF is a deliverable, so these assert the properties that would silently
+    ruin one: wrong frame count, and a colour scale that moves between frames."""
+
+    @staticmethod
+    def _frames(count=3, n=16):
+        y, x = np.mgrid[0:n, 0:n].astype(float) / (n - 1)
+        # A blob that migrates across the box, so frames are genuinely different.
+        return [np.exp(-40 * ((x - 0.2 - 0.3 * k) ** 2 + (y - 0.5) ** 2)) for k in range(count)]
+
+    def test_writes_a_gif_with_one_frame_per_field(self, tmp_path):
+        from PIL import Image
+
+        from lms.viz.animate import contour_animation
+
+        fields = self._frames(3)
+        out = contour_animation(
+            fields,
+            reynolds=[100.0, 400.0, 1000.0],
+            label="test",
+            norm=PowerNorm(gamma=1.0, vmin=0.0, vmax=1.0),
+            fps=4,
+            dpi=40,
+            figsize=(2.4, 2.2),
+            save=tmp_path / "anim.gif",
+        )
+        assert out.exists()
+        with Image.open(out) as img:
+            assert img.format == "GIF"
+            assert img.n_frames == len(fields)
+            # Constant dimensions: a "tight" savefig bbox would vary these per frame
+            # and produce a shivering or malformed GIF.
+            sizes = set()
+            for i in range(img.n_frames):
+                img.seek(i)
+                sizes.add(img.size)
+            assert len(sizes) == 1
+
+    def test_rejects_mismatched_frame_and_label_counts(self, tmp_path):
+        from lms.viz.animate import contour_animation
+
+        with pytest.raises(ValueError, match="Reynolds"):
+            contour_animation(
+                self._frames(3),
+                reynolds=[100.0],
+                label="test",
+                norm=PowerNorm(gamma=1.0, vmin=0.0, vmax=1.0),
+                save=tmp_path / "bad.gif",
+            )
+
+    def test_the_supplied_norm_is_not_mutated(self, tmp_path):
+        """The flicker guarantee. If the animator recomputed or rescaled the norm per
+        frame, identical data would take different colours as the sweep progressed."""
+        from lms.viz.animate import contour_animation
+
+        norm = PowerNorm(gamma=0.6, vmin=0.0, vmax=1.0)
+        before = (norm.vmin, norm.vmax, norm.gamma)
+        contour_animation(
+            self._frames(3),
+            reynolds=[100.0, 400.0, 1000.0],
+            label="test",
+            norm=norm,
+            dpi=40,
+            figsize=(2.4, 2.2),
+            save=tmp_path / "anim.gif",
+        )
+        assert (norm.vmin, norm.vmax, norm.gamma) == before
+
+    def test_pooled_norm_spans_every_frame_not_just_one(self):
+        """Vorticity grows with Re, so a norm fitted to the first frame alone would
+        saturate the rest of the animation."""
+        from lms.viz.animate import pooled_norm
+
+        fields = [np.full((8, 8), 1.0), np.full((8, 8), 5.0)]
+        norm = pooled_norm(fields, lambda pool: PowerNorm(1.0, 0.0, float(pool.max())))
+        assert norm.vmax == pytest.approx(5.0)
+
+    def test_pooled_norm_ignores_masked_solid_cells(self):
+        from lms.viz.animate import pooled_norm
+
+        solid = np.zeros((8, 8), dtype=bool)
+        solid[0, :] = True
+        fields = [np.ones((8, 8))]
+        fields[0][0, :] = 99.0
+        norm = pooled_norm(fields, lambda pool: PowerNorm(1.0, 0.0, float(pool.max())), solid=solid)
+        assert norm.vmax == pytest.approx(1.0)

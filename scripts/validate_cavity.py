@@ -42,10 +42,8 @@ def main() -> None:
 
     start = time.perf_counter()
 
-    def progress(step: int, s) -> None:
+    def progress(step: int, _solver) -> None:
         if step % 20_000 == 0:
-            res = s and None
-            del res
             elapsed = time.perf_counter() - start
             print(f"  step {step:>7,}   {step / elapsed:,.0f} steps/s")
 

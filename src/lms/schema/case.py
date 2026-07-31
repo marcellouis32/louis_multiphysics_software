@@ -297,7 +297,6 @@ class Case(Strict):
     @model_validator(mode="after")
     def _physics_sanity(self) -> Case:
         groups = self.dimensionless()
-        imp = self.primary_impeller
         if groups.reynolds < 10.0:
             raise ValueError(
                 f"impeller Reynolds number is {groups.reynolds:.2g}; below ~10 the flow is "
@@ -316,7 +315,6 @@ class Case(Strict):
                 f"unbaffled tank at Froude {groups.froude:.2f} will form a surface vortex, "
                 "which this solver does not model (no free surface). Add baffles or reduce speed."
             )
-        del imp
         return self
 
 

@@ -19,6 +19,7 @@ from lms.lbm.solver2d import (
     stream_function,
     vortex_centre,
 )
+from lms.lbm import solver2d, sweep
 from lms.validation import ghia, taylor_green
 
 
@@ -253,3 +254,59 @@ def test_cavity_matches_ghia_re1000():
 
     assert ghia.rms_error(y, u, gy, gu) < 0.025
     assert ghia.rms_error(x, v, gx, gv) < 0.025
+
+
+class TestReynoldsSweep:
+    """Parameter continuation. The sweep is the basis of the animated deliverable, so
+    the ordering guarantee and the warm-start payoff are both asserted rather than
+    assumed."""
+
+    def test_frames_come_back_in_the_requested_order(self):
+        values = [100.0, 160.0, 250.0]
+        frames = list(
+            sweep.reynolds_sweep(n=24, reynolds_values=values, tol=1e-4, max_steps=20_000)
+        )
+        assert [f.reynolds for f in frames] == values
+        for f in frames:
+            assert f.ux.shape == f.uy.shape == (24, 24)
+            assert np.isfinite(f.ux).all() and np.isfinite(f.uy).all()
+            assert f.tau > 0.5
+            assert f.steps > 0
+
+    def test_warm_start_converges_in_fewer_steps_than_starting_from_rest(self):
+        """The entire justification for continuation, made executable. If this ever
+        fails, the warm start has stopped helping and the extra machinery is dead
+        weight."""
+        values = [100.0, 160.0]
+        kwargs = {"n": 24, "reynolds_values": values, "tol": 3e-5, "max_steps": 40_000}
+        warm = list(sweep.reynolds_sweep(**kwargs))
+        cold = list(sweep.reynolds_sweep(**kwargs, cold_start=True))
+
+        # First case starts from rest either way, so it is the control.
+        assert warm[0].steps == cold[0].steps
+        assert warm[1].steps < cold[1].steps
+        assert all(f.converged for f in warm + cold)
+
+    def test_warm_start_discards_the_nonphysical_density_on_solid_nodes(self):
+        """Solid nodes hold bounce-back populations, so `macroscopic` reports wild
+        densities there. Copying them into the new solver's equilibrium seeds a wall
+        of garbage that streams into the fluid and diverges the solve."""
+        solver = solver2d.lid_driven_cavity(n=16, reynolds=100.0, lid_velocity=0.1)
+        wild_rho = np.full((16, 16), 1.0)
+        wild_rho[solver.solid] = -50.0
+        sweep.warm_start(solver, np.zeros((16, 16)), np.zeros((16, 16)), wild_rho)
+
+        assert np.all(solver.rho[solver.solid] == 1.0)
+        assert np.isfinite(solver.f).all()
+        assert solver.f.min() > 0.0
+
+    def test_sweep_values_pin_the_ghia_benchmarks_exactly(self):
+        values = sweep.sweep_values(lowest=100.0, highest=3200.0, count=25)
+        for anchor in (100.0, 400.0, 1000.0):
+            assert np.isclose(values, anchor).any()
+        assert (np.diff(values) > 0).all()
+        assert values[0] >= 100.0 and values[-1] <= 3200.0
+        # Log spacing: the ratio between neighbours should be roughly constant, unlike
+        # a linear ladder which would crawl at low Re and leap at high Re.
+        ratios = values[1:] / values[:-1]
+        assert ratios.max() / ratios.min() < 2.0

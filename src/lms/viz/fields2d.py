@@ -275,6 +275,50 @@ def _levels_from_norm(norm, count: int) -> np.ndarray:
     return levels
 
 
+def _draw_contour_layers(ax, xs, ys, data, filled, lines, cmap, norm):
+    """Draw the filled bands and the overlaid isolines into an existing Axes.
+
+    Split out of `plot_contours` so the animator can clear one persistent Axes and
+    redraw into it each frame. `contourf` cannot be updated in place, so a redraw is
+    the only option; keeping the figure and colorbar outside this function is what
+    stops the colorbar stacking up over a hundred frames.
+    """
+    cf = ax.contourf(xs, ys, data, levels=filled, cmap=cmap, norm=norm, extend="both")
+    # Kills the hairline seams contourf leaves between bands. ContourSet became a
+    # Collection in matplotlib 3.8; .collections was removed in 3.10.
+    if hasattr(cf, "set_edgecolor"):
+        cf.set_edgecolor("face")
+    else:
+        for c in cf.collections:
+            c.set_edgecolor("face")
+    ax.contour(xs, ys, data, levels=lines, colors="white", linewidths=0.45, alpha=0.32)
+    return cf
+
+
+def contour_inputs(
+    field: np.ndarray,
+    norm=None,
+    n_filled: int = 28,
+    n_lines: int = 14,
+    solid: np.ndarray | None = None,
+    extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+):
+    """Masked data, axis coordinates and level sets for one contour frame.
+
+    Shared by `plot_contours` and the animator so both derive levels from the norm
+    the same way. Returns `(data, xs, ys, filled, lines, norm)`.
+    """
+    mask = solid.astype(bool) if solid is not None else None
+    data = np.ma.masked_where(mask, field) if mask is not None else np.ma.asarray(field)
+    if norm is None:
+        norm = PowerNorm(gamma=1.0, vmin=float(data.min()), vmax=float(data.max()))
+
+    ny, nx = field.shape
+    xs = np.linspace(extent[0], extent[1], nx)
+    ys = np.linspace(extent[2], extent[3], ny)
+    return data, xs, ys, _levels_from_norm(norm, n_filled), _levels_from_norm(norm, n_lines), norm
+
+
 def plot_contours(
     field: np.ndarray,
     label: str,
@@ -293,29 +337,13 @@ def plot_contours(
     Complements the LIC renderer rather than replacing it: contours give readable
     quantitative levels, LIC gives continuous structure.
     """
-    mask = solid.astype(bool) if solid is not None else None
-    data = np.ma.masked_where(mask, field) if mask is not None else np.ma.asarray(field)
-    if norm is None:
-        norm = PowerNorm(gamma=1.0, vmin=float(data.min()), vmax=float(data.max()))
-
-    filled = _levels_from_norm(norm, n_filled)
-    lines = _levels_from_norm(norm, n_lines)
-
-    ny, nx = field.shape
-    xs = np.linspace(extent[0], extent[1], nx)
-    ys = np.linspace(extent[2], extent[3], ny)
+    data, xs, ys, filled, lines, norm = contour_inputs(
+        field, norm=norm, n_filled=n_filled, n_lines=n_lines, solid=solid, extent=extent
+    )
 
     with house_style():
         fig, ax = plt.subplots(figsize=(6.6, 6.0))
-        cf = ax.contourf(xs, ys, data, levels=filled, cmap=cmap, norm=norm, extend="both")
-        # Kills the hairline seams contourf leaves between bands. ContourSet became a
-        # Collection in matplotlib 3.8; .collections was removed in 3.10.
-        if hasattr(cf, "set_edgecolor"):
-            cf.set_edgecolor("face")
-        else:
-            for c in cf.collections:
-                c.set_edgecolor("face")
-        ax.contour(xs, ys, data, levels=lines, colors="white", linewidths=0.45, alpha=0.32)
+        _draw_contour_layers(ax, xs, ys, data, filled, lines, cmap, norm)
 
         colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax, label)
         ax.set_title(title)

@@ -167,6 +167,37 @@ Quiver plots and hand-seeded streamlines both misrepresent recirculation zones �
 you only where you happened to look. The texture is generated at 3× grid resolution and
 histogram-equalised; without both it aliases into grey mush.
 
+### Reynolds sweep
+
+![velocity magnitude sweep](figures/anim_speed_sweep_n192.gif)
+
+26 solutions from Re = 100 to Re = 3200, 192², warm-started from one another by parameter
+continuation. **Every frame is a separately converged steady solution — nothing is
+interpolated.** That distinction is the reason the sweep runs 26 cases instead of padding
+three; a tweened frame would solve nothing and the animation would be an illustration
+rather than a result.
+
+This is a walk through parameter space, not through time. The 2D cavity is genuinely
+steady below Re ≈ 8000, so a sequence of steady states is a legitimate physical
+progression. What it shows is the migration Ghia tabulates: the primary vortex starts at
+(0.618, 0.740) and moves monotonically to (0.518, 0.540) as inertia overtakes viscosity,
+one cell at a time. Ghia's tabulated centre appears as an orange ring at Re = 100, 400 and
+1000; the computed cross falls inside it at all three.
+
+![vorticity sweep](figures/anim_vorticity_sweep_n192.gif)
+
+The same sweep in vorticity. At Re = 100 viscosity smears vorticity through the whole
+interior; by Re = 3200 it has collapsed into thin wall layers surrounding a large flat
+uniform-vorticity core — the Batchelor limit. Both colour scales are pooled across all 26
+frames and then frozen, so a change of colour is a change in the flow rather than a change
+in the normalisation.
+
+Eight of the 26 frames stopped on their 150,000-step budget rather than on the 10⁻⁶
+tolerance, and are labelled as such. Re-solving the hardest of them (Re = 3200) properly
+took 327,500 steps and moved the vortex centre not at all, changed ψ_min by 0.15% and the
+whole velocity field by 1.2×10⁻³ in relative L2. Re = 3200 bounds the other seven, so the
+capped frames sit within 0.2% of their converged solutions.
+
 ---
 
 ## 4. Validation
