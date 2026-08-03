@@ -310,3 +310,34 @@ class TestReynoldsSweep:
         # a linear ladder which would crawl at low Re and leap at high Re.
         ratios = values[1:] / values[:-1]
         assert ratios.max() / ratios.min() < 2.0
+
+    def test_a_seed_warm_starts_the_first_case(self):
+        """Resume support. A run that died partway is restarted from the last frame it
+        finished, so the resumed cases must be seeded rather than started from rest --
+        otherwise resuming silently costs more than not having crashed."""
+        values = [100.0, 160.0]
+        full = list(sweep.reynolds_sweep(n=24, reynolds_values=values, tol=3e-5,
+                                         max_steps=40_000))
+        # Re-solve only the second case, seeded from the first, as a resume would.
+        resumed = list(
+            sweep.reynolds_sweep(
+                n=24, reynolds_values=values[1:], tol=3e-5, max_steps=40_000,
+                seed=(full[0].ux, full[0].uy, full[0].rho),
+            )
+        )
+        assert resumed[0].steps == full[1].steps
+        assert np.allclose(resumed[0].ux, full[1].ux, atol=1e-12)
+
+    def test_cold_start_ignores_a_seed(self):
+        """`--cold-start` means from rest, and a leftover seed must not quietly
+        reintroduce continuation and invalidate the comparison it exists to make."""
+        values = [100.0]
+        rest = list(sweep.reynolds_sweep(n=20, reynolds_values=values, tol=1e-4,
+                                         max_steps=20_000, cold_start=True))
+        junk = np.full((20, 20), 0.03)
+        seeded = list(
+            sweep.reynolds_sweep(n=20, reynolds_values=values, tol=1e-4,
+                                 max_steps=20_000, cold_start=True,
+                                 seed=(junk, junk, np.ones((20, 20)))),
+        )
+        assert seeded[0].steps == rest[0].steps

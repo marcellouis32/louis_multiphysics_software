@@ -71,6 +71,7 @@ def reynolds_sweep(
     tol: float = 1e-6,
     max_steps: int = 150_000,
     cold_start: bool = False,
+    seed: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None,
 ) -> Iterator[SweepFrame]:
     """Solve the cavity at each Reynolds number, warm-starting from the previous one.
 
@@ -87,10 +88,16 @@ def reynolds_sweep(
     Set `cold_start=True` to start every case from rest instead -- used by the tests to
     demonstrate that continuation actually helps.
 
+    `seed` is an `(ux, uy, rho)` triple to warm-start the *first* case from. It exists so
+    a run that died partway can be resumed without breaking the continuation chain: pick
+    up at the first unsolved Reynolds number, seeded from the last one that finished, and
+    the resumed frames cost the same as they would have in the original run.
+
     Yields frames in the order given, so a caller can stream results to disk rather than
     holding the whole sweep in memory.
     """
     previous: SweepFrame | None = None
+    pending_seed = None if cold_start else seed
 
     for re in reynolds_values:
         solver = lid_driven_cavity(
@@ -98,6 +105,9 @@ def reynolds_sweep(
         )
         if previous is not None and not cold_start:
             warm_start(solver, previous.ux, previous.uy, previous.rho)
+        elif pending_seed is not None:
+            warm_start(solver, *pending_seed)
+            pending_seed = None
 
         state = solver.run(max_steps=max_steps, tol=tol, check_every=500)
 
