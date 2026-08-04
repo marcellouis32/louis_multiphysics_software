@@ -263,6 +263,52 @@ class D3Q19Solver:
         self._initialise()
         self._parity = 0
 
+    def set_state(
+        self,
+        rho: np.ndarray,
+        ux: np.ndarray,
+        uy: np.ndarray,
+        uz: np.ndarray,
+        f_neq: np.ndarray | None = None,
+    ) -> None:
+        """Seed the solver from a macroscopic field, at equilibrium.
+
+        `f_neq` supplies the non-equilibrium part, which carries the strain rate. It is
+        optional but rarely optional in practice: omitting it discards the stress, and
+        the solver rebuilds it only after radiating an acoustic transient whose error
+        does not shrink at second order under refinement. In a convergence study that
+        shows up as a degraded order and looks exactly like a solver defect.
+
+        Both buffers are written, because `step()` alternates between two compiled
+        kernels and which one runs first depends on the parity.
+        """
+        feq = d3q19.equilibrium(
+            np.ascontiguousarray(rho, dtype=np.float64),
+            np.ascontiguousarray(ux, dtype=np.float64),
+            np.ascontiguousarray(uy, dtype=np.float64),
+            np.ascontiguousarray(uz, dtype=np.float64),
+        )
+        if f_neq is not None:
+            # `f_neq` is the pre-collision Chapman-Enskog part, but these buffers hold
+            # *post-collision* populations: `step()` pulls from the buffer, then
+            # collides, then writes. Collision has already acted on what is stored, so
+            # the non-equilibrium part must be scaled by (1 - omega). Omitting the
+            # factor does not merely shrink the correction -- with omega near 1.9 it
+            # flips its sign, so the initial stress is applied backwards and the run
+            # starts further from the truth than equilibrium alone.
+            # The strain-rate part is symmetric under i -> opposite(i), so under TRT it
+            # relaxes at omega_plus.
+            feq = feq + (1.0 - self.omega_plus) * f_neq
+        # Stored shifted by the rest weights, and laid out (x, y, z, Q) for Taichi.
+        shifted = (feq - d3q19.W[:, None, None, None]).transpose(1, 2, 3, 0)
+        packed = np.ascontiguousarray(shifted, dtype=_np_dtype(self.ti, self.dtype))
+        self.f.from_numpy(packed)
+        self.f_new.from_numpy(packed)
+        self.rho.from_numpy(np.ascontiguousarray(rho, dtype=packed.dtype))
+        vel = np.stack([ux, uy, uz], axis=-1)
+        self.vel.from_numpy(np.ascontiguousarray(vel, dtype=packed.dtype))
+        self._parity = 0
+
     def set_moving_wall(self, mask: np.ndarray, ux=0.0, uy=0.0, uz=0.0) -> None:
         """Give the selected solid nodes a translation velocity."""
         vel = self.wall_vel.to_numpy()

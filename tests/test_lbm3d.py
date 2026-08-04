@@ -234,3 +234,118 @@ class TestSolver3D:
         init_backend(prefer_gpu=False, precision="fp64")
         with pytest.raises(ValueError, match="compressible"):
             lid_driven_cavity_3d(n=16, nz=4, lid_velocity=0.5)
+
+
+class TestBeltrami:
+    """The exact-solution checks. These verify the *analytic* field's defining
+    properties first, because a convergence study against a wrong reference solution
+    measures nothing and looks entirely healthy while doing it."""
+
+    N, U0, NU = 16, 0.05, 0.01
+
+    @staticmethod
+    def _dx(f, axis):
+        """Periodic central difference. np.gradient uses one-sided stencils at the
+        array edges, which are simply wrong for a periodic field."""
+        return (np.roll(f, -1, axis=axis) - np.roll(f, 1, axis=axis)) / 2.0
+
+    def test_analytic_field_is_divergence_free(self):
+        from lms.validation.beltrami import analytic
+
+        ux, uy, uz, _ = analytic(self.N, self.U0, self.NU, 0.0)
+        div = self._dx(ux, 0) + self._dx(uy, 1) + self._dx(uz, 2)
+        # Each component is independent of its own coordinate, so this is not merely
+        # small -- it is identically zero.
+        assert np.abs(div).max() == 0.0
+
+    def test_analytic_field_is_beltrami(self):
+        """curl(u) parallel to u is what kills the nonlinear term and makes the flow an
+        exact solution. The discrete central difference of sin(kx) carries sin(k) rather
+        than k, so the comparison uses sin(k)."""
+        from lms.validation.beltrami import analytic
+
+        ux, uy, uz, _ = analytic(self.N, self.U0, self.NU, 0.0)
+        k_discrete = np.sin(2.0 * np.pi / self.N)
+        cx = self._dx(uz, 1) - self._dx(uy, 2)
+        cy = self._dx(ux, 2) - self._dx(uz, 0)
+        cz = self._dx(uy, 0) - self._dx(ux, 1)
+        for got, want in ((cx, ux), (cy, uy), (cz, uz)):
+            assert np.abs(got - k_discrete * want).max() < 1e-15
+
+    def test_nonlinear_term_is_a_pure_gradient(self):
+        """u x curl(u) = 0 is the reason the Navier-Stokes equations collapse to a heat
+        equation here. If this were not zero the 'exact' solution would not be exact."""
+        from lms.validation.beltrami import analytic
+
+        ux, uy, uz, _ = analytic(self.N, self.U0, self.NU, 0.0)
+        cx = self._dx(uz, 1) - self._dx(uy, 2)
+        cy = self._dx(ux, 2) - self._dx(uz, 0)
+        cz = self._dx(uy, 0) - self._dx(ux, 1)
+        cross = (uy * cz - uz * cy, uz * cx - ux * cz, ux * cy - uy * cx)
+        scale = float(np.abs(ux).max()) ** 2
+        assert max(np.abs(c).max() for c in cross) / scale < 1e-14
+
+    def test_field_decays_at_the_viscous_rate(self):
+        from lms.validation.beltrami import analytic
+
+        k = 2.0 * np.pi / self.N
+        t = 500.0
+        a, *_ = analytic(self.N, self.U0, self.NU, 0.0)
+        b, *_ = analytic(self.N, self.U0, self.NU, t)
+        expected = np.exp(-self.NU * k * k * t)
+        assert np.abs(b).max() / np.abs(a).max() == pytest.approx(expected, rel=1e-12)
+
+    def test_analytic_strain_matches_finite_differences(self):
+        """The closed-form gradient feeds the non-equilibrium initial state. If it were
+        wrong the initialisation would be wrong in a way nothing else would catch."""
+        from lms.validation.beltrami import analytic, analytic_strain
+
+        n = 32
+        ux, uy, uz, _ = analytic(n, self.U0, self.NU, 0.0)
+        grad = analytic_strain(n, self.U0, self.NU, 0.0)
+        k = 2.0 * np.pi / n
+        # Central differencing scales the exact derivative by sin(k)/k.
+        factor = np.sin(k) / k
+        for b, comp in enumerate((ux, uy, uz)):
+            for a in range(3):
+                assert np.abs(self._dx(comp, a) - factor * grad[a, b]).max() < 1e-15
+
+    def test_nonequilibrium_carries_the_viscous_stress(self):
+        """Sum_i e_ia e_ib f_i^(1) must equal -2 tau rho cs^2 S_ab. That identity is
+        what makes the correction the viscous stress rather than an arbitrary tweak."""
+        from lms.lbm import d3q19
+        from lms.validation.beltrami import analytic, analytic_strain, nonequilibrium
+
+        n, tau = 16, 0.8
+        _, _, _, rho = analytic(n, self.U0, self.NU, 0.0)
+        grad = analytic_strain(n, self.U0, self.NU, 0.0)
+        strain = 0.5 * (grad + grad.transpose(1, 0, 2, 3, 4))
+        fneq = nonequilibrium(rho, grad, tau)
+
+        e = np.stack([d3q19.EX, d3q19.EY, d3q19.EZ]).astype(float)
+        # Relative to the size of the stress itself: the components are O(5e-3), so an
+        # absolute bound would be measuring float64's exponent rather than the identity.
+        scale = 2.0 * tau * d3q19.CS2 * np.abs(strain).max()
+        for a in range(3):
+            for b in range(3):
+                got = np.tensordot(e[a] * e[b], fneq, axes=(0, 0))
+                want = -2.0 * tau * rho * d3q19.CS2 * strain[a, b]
+                assert np.abs(got - want).max() / scale < 1e-13, f"component {a}{b}"
+
+    def test_nonequilibrium_start_beats_equilibrium_after_one_step(self):
+        """The whole justification for computing f_neq at all. One step is enough,
+        because this is an initialisation error, not an accumulated one."""
+        from lms.validation.beltrami import run_case
+
+        with_neq = run_case(24, self.U0, self.NU, steps=1)
+        without = run_case(24, self.U0, self.NU, steps=1, equilibrium_only=True)
+        assert with_neq.error < 0.2 * without.error
+
+    def test_diffusive_refinement_holds_tau_and_reynolds_fixed(self):
+        from lms.validation.beltrami import diffusive_ladder
+
+        results = diffusive_ladder(sizes=(16, 24), u0=0.05, nu=0.01, steps0=60)
+        assert results[0].nu == results[1].nu           # same tau
+        assert results[0].reynolds == pytest.approx(results[1].reynolds, rel=1e-12)
+        # Mach falls like 1/n, which is what drives the O(Ma^2) error down at 1/n^2.
+        assert results[1].mach == pytest.approx(results[0].mach * 16 / 24, rel=1e-12)
