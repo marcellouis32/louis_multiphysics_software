@@ -349,3 +349,51 @@ class TestBeltrami:
         assert results[0].reynolds == pytest.approx(results[1].reynolds, rel=1e-12)
         # Mach falls like 1/n, which is what drives the O(Ma^2) error down at 1/n^2.
         assert results[1].mach == pytest.approx(results[0].mach * 16 / 24, rel=1e-12)
+
+
+class TestConvergenceCriterion:
+    """In fp32 the residual floors around 1e-5, so the usual 1e-6 tolerance is
+    unreachable and a perfectly converged run would report failure forever."""
+
+    def test_residual_floor_reflects_the_precision(self):
+        from lms.lbm.solver3d import D3Q19Solver, init_backend
+
+        for prefer_gpu, precision, bound in ((True, "fp32", 1e-5), (False, "fp64", 1e-11)):
+            init_backend(prefer_gpu=prefer_gpu, precision=precision)
+            s = D3Q19Solver((8, 8, 8), omega=1.8, solid=np.zeros((8, 8, 8), dtype=bool))
+            assert s.residual_floor == bound
+
+    def test_stagnation_fires_once_the_residual_stops_improving(self):
+        from lms.lbm.solver3d import _has_stagnated
+
+        flat = [(i, 1.1e-5) for i in range(20)]
+        assert _has_stagnated(flat, window=8, ratio=0.02)
+
+    def test_stagnation_holds_off_while_the_residual_is_still_falling(self):
+        from lms.lbm.solver3d import _has_stagnated
+
+        falling = [(i, 10.0 ** (-i / 2)) for i in range(20)]
+        assert not _has_stagnated(falling, window=8, ratio=0.02)
+
+    def test_stagnation_needs_two_full_windows_before_deciding(self):
+        """Otherwise a couple of noisy early checks could end the run immediately."""
+        from lms.lbm.solver3d import _has_stagnated
+
+        assert not _has_stagnated([(i, 1e-5) for i in range(15)], window=8, ratio=0.02)
+
+    def test_stagnation_can_be_disabled(self):
+        from lms.lbm.solver3d import _has_stagnated
+
+        assert not _has_stagnated([(i, 1e-5) for i in range(40)], window=0, ratio=0.02)
+
+    def test_fp32_run_reports_stagnation_not_failure(self):
+        """The end-to-end statement: a converged fp32 solution is labelled converged."""
+        from lms.lbm.solver3d import init_backend, lid_driven_cavity_3d
+
+        init_backend(prefer_gpu=True, precision="fp32")
+        s = lid_driven_cavity_3d(n=24, nz=24, reynolds=400.0, lid_velocity=0.1,
+                                 periodic_z=False)
+        state = s.run(max_steps=60_000, tol=1e-9, check_every=500)
+        assert state.converged
+        assert state.stopped_on == "stagnation"
+        assert state.steps < 60_000

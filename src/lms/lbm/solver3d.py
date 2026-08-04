@@ -90,6 +90,14 @@ class SolverState3D:
     steps: int
     converged: bool
     residuals: list[tuple[int, float]] = field(default_factory=list)
+    stopped_on: str = "step cap"
+    """Why the run ended: "tolerance", "stagnation" or "step cap".
+
+    Worth distinguishing. In fp32 the residual floors around 1e-5, so a stricter
+    tolerance is unreachable and a converged solution would otherwise be labelled a
+    failure -- which understates a perfectly good result rather than overstating it,
+    but is still wrong.
+    """
 
     @property
     def speed(self) -> np.ndarray:
@@ -340,22 +348,50 @@ class D3Q19Solver:
         vel = self.vel.to_numpy()
         return self.rho.to_numpy(), vel[..., 0], vel[..., 1], vel[..., 2]
 
+    @property
+    def residual_floor(self) -> float:
+        """Roughly the smallest residual this precision can express.
+
+        The residual is a relative change in the speed field between checks, so it
+        cannot fall below the rounding noise of the arithmetic producing it. Measured on
+        the 3D cavity: fp32 plateaus near 1.1e-5 and stays there indefinitely, while
+        fp64 keeps falling past 1e-12. A tolerance below this figure can never be met,
+        and a solver asked to meet one will burn its whole step budget and then report
+        failure on a solution that stopped changing long ago.
+        """
+        return 1e-5 if self.dtype == self.ti.f32 else 1e-11
+
     def run(
         self,
         max_steps: int,
         tol: float = 1e-6,
         check_every: int = 500,
         callback: Callable[[int, D3Q19Solver], None] | None = None,
+        stagnation_window: int = 8,
+        stagnation_ratio: float = 0.02,
     ) -> SolverState3D:
         """Advance to steady state, or until the step budget runs out.
 
         Convergence is the relative change in the speed field between checks, the same
         criterion the 2D solver uses, so the two are directly comparable.
+
+        There are two ways to converge, and in fp32 the second is the one that fires.
+        `tol` is the usual absolute threshold. But in single precision the residual
+        floors at `residual_floor` -- around 1e-5 -- so any stricter tolerance is
+        unreachable no matter how long the run continues. Stagnation detection catches
+        that case: once the residual stops improving by more than `stagnation_ratio`
+        between consecutive windows of `stagnation_window` checks, the field has stopped
+        changing and the run is done. Verified directly on the 3D cavity, where 900,000
+        steps gave the same profile as 250,000 to four decimal places while never once
+        satisfying a 1e-6 tolerance.
+
+        Set `stagnation_window=0` to disable and use `tol` alone.
         """
         self._speed_field()
         prev = self._speed.to_numpy()
         residuals: list[tuple[int, float]] = []
         converged = False
+        stopped_on = "step cap"
         step = 0
 
         for step in range(1, max_steps + 1):
@@ -378,14 +414,36 @@ class D3Q19Solver:
                 if callback:
                     callback(step, self)
                 if res < tol:
-                    converged = True
+                    converged, stopped_on = True, "tolerance"
+                    break
+                if _has_stagnated(residuals, stagnation_window, stagnation_ratio):
+                    converged, stopped_on = True, "stagnation"
                     break
 
         rho, ux, uy, uz = self.macroscopic()
         return SolverState3D(
             ux=ux, uy=uy, uz=uz, rho=rho,
             steps=step, converged=converged, residuals=residuals,
+            stopped_on=stopped_on,
         )
+
+
+def _has_stagnated(residuals, window: int, ratio: float) -> bool:
+    """True once the residual has stopped improving between consecutive windows.
+
+    Compares the mean of the last `window` residuals against the mean of the `window`
+    before it. Averaging matters: the fp32 residual jitters by a few percent around its
+    floor, so comparing individual checks would either fire early on a lucky pair or
+    never fire at all.
+    """
+    if window <= 0 or len(residuals) < 2 * window:
+        return False
+    values = [r for _, r in residuals]
+    recent = sum(values[-window:]) / window
+    earlier = sum(values[-2 * window:-window]) / window
+    if earlier <= 0.0:
+        return True
+    return (earlier - recent) / earlier < ratio
 
 
 def _np_dtype(ti, dtype):

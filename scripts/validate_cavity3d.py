@@ -92,7 +92,7 @@ def main() -> None:
           f"U = {args.lid_velocity}  ({arch} fp32)")
     print("Ghia et al. is a *2D* reference. The mid-plane must approach it as the span")
     print("grows; at span = 1 the gap is the end-wall effect, not solver error.\n")
-    print(f"{'span':>6} {'nz':>5} {'cells':>9} {'steps':>8} {'conv':>6} "
+    print(f"{'span':>6} {'nz':>5} {'cells':>9} {'steps':>8} {'stopped on':>10} "
           f"{'RMS u':>8} {'RMS v':>8} {'sym x':>9} {'sym z':>9} {'time':>7}")
 
     rows = []
@@ -113,7 +113,7 @@ def main() -> None:
         sym_z = symmetry_residual(state.uz, odd=True)
 
         print(f"{span:>6.1f} {nz:>5} {args.n**2 * nz / 1e6:>8.2f}M {state.steps:>8,} "
-              f"{'yes' if state.converged else 'CAP':>6} {rms_u:>8.4f} {rms_v:>8.4f} "
+              f"{state.stopped_on:>10} {rms_u:>8.4f} {rms_v:>8.4f} "
               f"{sym_x:>9.2e} {sym_z:>9.2e} {elapsed:>6.0f}s")
 
         np.savez_compressed(
@@ -121,7 +121,7 @@ def main() -> None:
             ux=state.ux, uy=state.uy, uz=state.uz, rho=state.rho,
             solid=solver.solid.to_numpy(), reynolds=args.reynolds,
             lid_velocity=args.lid_velocity, span=span, steps=state.steps,
-            converged=state.converged,
+            converged=state.converged, stopped_on=state.stopped_on,
         )
         rows.append((span, rms_u, rms_v, sym_x, sym_z))
 
