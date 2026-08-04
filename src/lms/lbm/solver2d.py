@@ -8,8 +8,9 @@ the GPU kernels are tested against.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Literal
+from typing import Literal
 
 import numpy as np
 
@@ -147,7 +148,7 @@ class D2Q9Solver:
         max_steps: int,
         tol: float = 1e-6,
         check_every: int = 500,
-        callback: Callable[[int, "D2Q9Solver"], None] | None = None,
+        callback: Callable[[int, D2Q9Solver], None] | None = None,
     ) -> SolverState:
         prev = np.hypot(self.ux, self.uy).copy()
         residuals: list[tuple[int, float]] = []
