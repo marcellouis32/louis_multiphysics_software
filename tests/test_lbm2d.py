@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from lms.lbm import solver2d, sweep
 from lms.lbm.d2q9 import (
     EX,
     EY,
@@ -19,7 +20,6 @@ from lms.lbm.solver2d import (
     stream_function,
     vortex_centre,
 )
-from lms.lbm import solver2d, sweep
 from lms.validation import ghia, taylor_green
 
 

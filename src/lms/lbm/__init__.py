@@ -9,9 +9,9 @@ from lms.lbm.solver2d import (
 __all__ = [
     "D2Q9Solver",
     "SolverState",
-    "lid_driven_cavity",
     "cavity_centerlines",
     "equilibrium",
+    "lid_driven_cavity",
     "macroscopic",
     "viscosity_to_omega",
 ]
