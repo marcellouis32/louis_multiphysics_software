@@ -212,3 +212,80 @@ class TestContourAnimation:
         fields[0][0, :] = 99.0
         norm = pooled_norm(fields, lambda pool: PowerNorm(1.0, 0.0, float(pool.max())), solid=solid)
         assert norm.vmax == pytest.approx(1.0)
+
+
+class TestSlices3D:
+    """Slicing is where a 3D renderer lies most easily: an off-by-one axis or the wrong
+    velocity pair produces a picture that looks entirely plausible and describes a flow
+    that does not exist."""
+
+    @staticmethod
+    def _ramp():
+        """A field whose value encodes its own coordinates, so a mis-sliced plane is
+        detectable by inspection rather than by eye."""
+        i, j, k = np.mgrid[0:6, 0:8, 0:10].astype(float)
+        return 100 * i + 10 * j + k
+
+    def test_slice_takes_the_requested_plane(self):
+        from lms.viz.fields3d import slice_plane
+
+        f = self._ramp()
+        assert slice_plane(f, "x", 2)[0, 0] == 200.0
+        assert slice_plane(f, "y", 3)[0, 0] == 30.0
+        assert slice_plane(f, "z", 4)[0, 0] == 4.0
+
+    def test_slice_defaults_to_the_centre_plane(self):
+        from lms.viz.fields3d import slice_plane
+
+        f = self._ramp()
+        assert np.array_equal(slice_plane(f, "z"), slice_plane(f, "z", 5))
+
+    def test_slice_is_transposed_for_drawing(self):
+        """Shape (nx, ny, nz) sliced normal to z leaves (nx, ny), which must come back
+        as (ny, nx) so matplotlib's row axis is the vertical one."""
+        from lms.viz.fields3d import slice_plane
+
+        assert slice_plane(self._ramp(), "z").shape == (8, 6)
+        assert slice_plane(self._ramp(), "x").shape == (10, 8)
+
+    def test_rejects_an_unknown_axis(self):
+        from lms.viz.fields3d import slice_plane
+
+        with pytest.raises(ValueError, match="axis must be one of"):
+            slice_plane(self._ramp(), "w")
+
+    def test_in_plane_components_pick_the_right_velocity_pair(self):
+        """Drawing streamlines from the out-of-plane component is the classic 3D
+        slicing error, and it is silent."""
+        from lms.viz.fields3d import in_plane_components
+
+        ux, uy, uz = (np.full((4, 5, 6), v) for v in (1.0, 2.0, 3.0))
+        assert [c.flat[0] for c in in_plane_components(ux, uy, uz, "x")] == [2.0, 3.0]
+        assert [c.flat[0] for c in in_plane_components(ux, uy, uz, "y")] == [1.0, 3.0]
+        assert [c.flat[0] for c in in_plane_components(ux, uy, uz, "z")] == [1.0, 2.0]
+
+    def test_orthogonal_slices_share_one_colour_scale(self):
+        """Three independently normalised panels would invite the reader to compare
+        colours that mean different things."""
+        from lms.viz.fields3d import plot_orthogonal_slices
+
+        norm = PowerNorm(gamma=1.0, vmin=0.0, vmax=1.0)
+        fig = plot_orthogonal_slices(self._ramp() / 1000.0, label="t", norm=norm)
+        assert (norm.vmin, norm.vmax) == (0.0, 1.0)   # not mutated
+        assert len(fig.axes) >= 3
+
+    def test_orthogonal_slices_rejects_a_2d_field(self):
+        from lms.viz.fields3d import plot_orthogonal_slices
+
+        with pytest.raises(ValueError, match="expected a 3D field"):
+            plot_orthogonal_slices(np.zeros((4, 4)), label="t")
+
+    def test_span_profiles_draws_reference_and_every_curve(self):
+        from lms.viz.fields3d import plot_span_profiles
+
+        coord = np.linspace(0, 1, 20)
+        profiles = {f"span {s}": (np.sin(coord * s), coord) for s in (1, 2, 3)}
+        fig = plot_span_profiles(profiles, reference=(np.cos(coord), coord))
+        ax = fig.axes[0]
+        assert len(ax.lines) >= len(profiles)
+        assert len(ax.collections) >= 1          # the reference scatter
