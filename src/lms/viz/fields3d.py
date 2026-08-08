@@ -173,8 +173,89 @@ def plot_span_profiles(
 
 __all__ = [
     "in_plane_components",
+    "plot_decay",
+    "plot_energy_spectra",
     "plot_orthogonal_slices",
     "plot_slice",
     "plot_span_profiles",
     "slice_plane",
 ]
+
+
+def plot_energy_spectra(
+    curves: dict,
+    title: str = "Energy spectrum",
+    subtitle: str = "",
+    slope_guide: float = -5.0 / 3.0,
+    guide_window: tuple[int, int] | None = None,
+    save: str | Path | None = None,
+):
+    """Log-log E(k) for several runs, with a Kolmogorov guide over a stated window.
+
+    `curves` maps a label to `(k, E)`. The guide line is drawn only across
+    `guide_window`, not the whole axis, because that window is the claim being made: at
+    these resolutions the inertial range spans a handful of wavenumbers, and a -5/3 line
+    stretched across the full spectrum implies a scaling range that does not exist.
+    """
+    from lms.viz.style import ACCENT_WARM
+
+    with house_style():
+        fig, ax = plt.subplots(figsize=(7.0, 5.4))
+        shades = plt.get_cmap(FLOW)(np.linspace(0.35, 0.92, max(len(curves), 1)))
+
+        for (label, (k, e)), shade in zip(curves.items(), shades):
+            k = np.asarray(k, dtype=float)
+            e = np.asarray(e, dtype=float)
+            good = (k > 0) & (e > 0)
+            ax.loglog(k[good], e[good], "-", color=shade, linewidth=1.7, label=label)
+
+        if guide_window is not None:
+            lo, hi = guide_window
+            anchor_k, anchor_e = None, None
+            for k, e in curves.values():
+                k, e = np.asarray(k, float), np.asarray(e, float)
+                band = (k >= lo) & (k <= hi) & (e > 0)
+                if band.any():
+                    anchor_k, anchor_e = k[band][0], e[band][0]
+                    break
+            if anchor_k is not None:
+                kk = np.linspace(lo, hi, 20)
+                ax.loglog(kk, anchor_e * (kk / anchor_k) ** slope_guide, "--",
+                          color=ACCENT_WARM, linewidth=1.2, alpha=0.9,
+                          label=f"$k^{{{slope_guide:.2f}}}$ over $k \\in [{lo}, {hi}]$")
+
+        ax.set_xlabel("wavenumber $k$")
+        ax.set_ylabel("$E(k)$")
+        ax.set_title(title)
+        if subtitle:
+            annotate(ax, subtitle, "lower left")
+        ax.legend(loc="lower left", framealpha=0.0, fontsize=8.5)
+        fig.tight_layout()
+        if save:
+            fig.savefig(save)
+        return fig
+
+
+def plot_decay(
+    curves: dict,
+    ylabel: str = "kinetic energy",
+    title: str = "Energy decay",
+    subtitle: str = "",
+    save: str | Path | None = None,
+):
+    """Scalar histories against eddy-turnover time, one line per run."""
+    with house_style():
+        fig, ax = plt.subplots(figsize=(6.6, 4.4))
+        shades = plt.get_cmap(FLOW)(np.linspace(0.35, 0.92, max(len(curves), 1)))
+        for (label, (t, y)), shade in zip(curves.items(), shades):
+            ax.semilogy(t, y, "-", color=shade, linewidth=1.7, label=label)
+        ax.set_xlabel("$t\\,/\\,T$   (eddy turnovers)")
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        if subtitle:
+            annotate(ax, subtitle, "lower left")
+        ax.legend(loc="upper right", framealpha=0.0, fontsize=8.5)
+        fig.tight_layout()
+        if save:
+            fig.savefig(save)
+        return fig
