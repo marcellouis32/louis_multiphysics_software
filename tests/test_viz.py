@@ -289,3 +289,36 @@ class TestSlices3D:
         ax = fig.axes[0]
         assert len(ax.lines) >= len(profiles)
         assert len(ax.collections) >= 1          # the reference scatter
+
+
+class TestAnimationOptions:
+    @staticmethod
+    def _frames(count=3, n=12):
+        y, x = np.mgrid[0:n, 0:n].astype(float) / (n - 1)
+        return [np.exp(-30 * ((x - 0.3 - 0.2 * k) ** 2 + (y - 0.5) ** 2)) for k in range(count)]
+
+    def test_isolines_can_be_switched_off(self, tmp_path):
+        """On a turbulent slice the contour tracer finds structure at every scale, so
+        overlaid isolines are noise rather than information -- and they roughly double
+        the GIF size."""
+        from lms.viz.animate import contour_animation
+
+        out = contour_animation(
+            self._frames(), reynolds=[1.0, 2.0, 3.0], label="t",
+            norm=PowerNorm(1.0, 0.0, 1.0), n_lines=0,
+            dpi=40, figsize=(2.2, 2.0), save=tmp_path / "a.gif",
+        )
+        assert out.exists()
+
+    def test_frame_captions_can_be_supplied_directly(self, tmp_path):
+        """The animator was written for Reynolds sweeps, but decaying turbulence needs
+        elapsed time in the caption instead."""
+        from lms.viz.animate import contour_animation
+
+        out = contour_animation(
+            self._frames(), reynolds=[0.0, 0.5, 1.0], label="t",
+            norm=PowerNorm(1.0, 0.0, 1.0),
+            labels=["t/T = 0.00", "t/T = 0.50", "t/T = 1.00"],
+            dpi=40, figsize=(2.2, 2.0), save=tmp_path / "b.gif",
+        )
+        assert out.exists()

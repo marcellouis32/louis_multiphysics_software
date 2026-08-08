@@ -291,7 +291,11 @@ def _draw_contour_layers(ax, xs, ys, data, filled, lines, cmap, norm):
     else:
         for c in cf.collections:
             c.set_edgecolor("face")
-    ax.contour(xs, ys, data, levels=lines, colors="white", linewidths=0.45, alpha=0.32)
+    # Isolines are readable on a smooth field and pure noise on a turbulent one, where
+    # a 256^2 slice has structure at every scale the contour tracer can find. Passing an
+    # empty level set turns them off.
+    if lines is not None and len(lines) > 1:
+        ax.contour(xs, ys, data, levels=lines, colors="white", linewidths=0.45, alpha=0.32)
     return cf
 
 

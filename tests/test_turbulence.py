@@ -80,14 +80,16 @@ class TestSpectrum:
 
     def test_inertial_slope_recovers_a_planted_power_law(self):
         k = np.arange(0, 64, dtype=float)
-        e = np.where(k > 0, k ** (-5 / 3), 0.0)
+        e = np.zeros_like(k)
+        e[1:] = k[1:] ** (-5 / 3)
         slope, window = inertial_slope(k, e, 4, 32)
         assert slope == pytest.approx(-5 / 3, abs=1e-9)
         assert window == (4, 32)
 
     def test_inertial_slope_refuses_a_window_too_narrow_to_fit(self):
         k = np.arange(0, 64, dtype=float)
-        e = np.where(k > 0, k ** (-5 / 3), 0.0)
+        e = np.zeros_like(k)
+        e[1:] = k[1:] ** (-5 / 3)
         with pytest.raises(ValueError, match="usable wavenumbers"):
             inertial_slope(k, e, 10, 11)
 
@@ -133,3 +135,44 @@ class TestStatistics:
         a = statistics(*field, nu=0.001)
         b = statistics(*field, nu=0.01)
         assert b.dissipation == pytest.approx(10.0 * a.dissipation, rel=1e-9)
+
+
+class TestVorticity:
+    """Vorticity on a periodic box, and the colour-map choice it implies."""
+
+    def test_curl_of_a_known_field(self):
+        """Solid-body rotation about z has omega = (0, 0, 2). Central differencing
+        represents the derivative as sin(k) rather than k, but for a linear field the
+        stencil is exact, so this pins the operator with no discretisation excuse."""
+        from lms.validation.turbulence import vorticity
+
+        n = 16
+        i, j, _ = np.mgrid[0:n, 0:n, 0:n].astype(float)
+        # Restrict to the interior so the periodic wrap of a non-periodic field does
+        # not contaminate the check.
+        wx, wy, wz = vorticity(-(j - n / 2), (i - n / 2), np.zeros((n, n, n)))
+        core = (slice(1, -1), slice(1, -1), slice(1, -1))
+        assert np.allclose(wz[core], 2.0)
+        assert np.allclose(wx[core], 0.0)
+        assert np.allclose(wy[core], 0.0)
+
+    def test_curl_uses_periodic_wraparound(self):
+        """np.gradient falls back to one-sided stencils at the array edges, which
+        invents a boundary on a periodic domain. A pure Fourier mode must give the same
+        answer on the faces as in the middle."""
+        from lms.validation.turbulence import vorticity
+
+        n = 16
+        _, j, _ = np.mgrid[0:n, 0:n, 0:n].astype(float)
+        k = 2 * np.pi / n
+        _, _, wz = vorticity(np.sin(k * j), np.zeros((n, n, n)), np.zeros((n, n, n)))
+        # The face values must match the interior pattern, not be one-sided artefacts.
+        assert np.abs(wz[:, 0, :] - wz[:, 0, :].mean()).max() < 1e-12
+        assert wz[:, 0, :].mean() == pytest.approx(-np.sin(k) * np.cos(0.0), abs=1e-12)
+
+    def test_enstrophy_is_non_negative(self, field):
+        """Which is why it must be rendered with a sequential colormap: a diverging map
+        centred on zero would spend half its range on values that cannot occur."""
+        from lms.validation.turbulence import enstrophy
+
+        assert enstrophy(*field).min() >= 0.0

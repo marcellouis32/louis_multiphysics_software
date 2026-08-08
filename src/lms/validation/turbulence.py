@@ -171,6 +171,33 @@ def statistics(
     )
 
 
+def vorticity(
+    ux: np.ndarray, uy: np.ndarray, uz: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Curl of a periodic velocity field, by central differences with wraparound.
+
+    `np.gradient` falls back to one-sided stencils at the array edges, which is simply
+    the wrong operator on a periodic domain: it invents a boundary where none exists and
+    reports spurious structure on three faces of the box. `np.roll` costs the same and
+    is correct everywhere.
+    """
+    def d(f, axis):
+        return (np.roll(f, -1, axis=axis) - np.roll(f, 1, axis=axis)) / 2.0
+
+    return (
+        d(uz, 1) - d(uy, 2),
+        d(ux, 2) - d(uz, 0),
+        d(uy, 0) - d(ux, 1),
+    )
+
+
+def enstrophy(ux: np.ndarray, uy: np.ndarray, uz: np.ndarray) -> np.ndarray:
+    """Vorticity magnitude |omega|. Strictly non-negative, so render it sequentially:
+    a diverging colormap on this wastes half its range on values that cannot occur."""
+    wx, wy, wz = vorticity(ux, uy, uz)
+    return np.sqrt(wx**2 + wy**2 + wz**2)
+
+
 def coarsen_spectral(field: np.ndarray, n_coarse: int) -> np.ndarray:
     """Truncate a field to a coarser grid by discarding high Fourier modes.
 
@@ -228,10 +255,12 @@ __all__ = [
     "coarsen_spectral",
     "dissipation_rate",
     "energy_spectrum",
+    "enstrophy",
     "inertial_slope",
     "kinetic_energy",
     "model_spectrum",
     "solenoidal_field",
     "statistics",
+    "vorticity",
     "wavenumbers",
 ]

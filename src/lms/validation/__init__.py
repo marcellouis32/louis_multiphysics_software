@@ -1,3 +1,3 @@
-from lms.validation import ghia
+from lms.validation import beltrami, ghia, taylor_green, turbulence
 
-__all__ = ["ghia"]
+__all__ = ["beltrami", "ghia", "taylor_green", "turbulence"]

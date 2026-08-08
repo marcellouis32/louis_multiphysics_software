@@ -41,8 +41,10 @@ from lms.lbm.solver3d import D3Q19Solver, init_backend
 from lms.validation.turbulence import (
     coarsen_spectral,
     energy_spectrum,
+    enstrophy,
     solenoidal_field,
     statistics,
+    vorticity,
 )
 
 
@@ -103,7 +105,13 @@ def main() -> None:
     )
     solver.set_state(rho, ux, uy, uz)
 
+    # Mid-plane slices per sample, for the animation. Stored as 2D slices rather than
+    # whole volumes: 25 snapshots of a 256^3 field would be 5 GB, while the slices are a
+    # few MB and are all the animation ever shows. Vorticity is computed from the full
+    # 3D field before slicing -- a single plane cannot give the out-of-plane derivatives.
     spectra, stats, sample_steps, nu_t_mean = [], [], [], []
+    snap_enstrophy, snap_wz = [], []
+    mid = n // 2
     t0 = time.perf_counter()
     for step in range(total_steps + 1):
         if step % every == 0:
@@ -116,6 +124,8 @@ def main() -> None:
             stats.append(statistics(gx, gy, gz, nu, step))
             sample_steps.append(step)
             nu_t_mean.append(float(solver.eddy_viscosity().mean()))
+            snap_enstrophy.append(enstrophy(gx, gy, gz)[:, :, mid].astype(np.float32))
+            snap_wz.append(vorticity(gx, gy, gz)[2][:, :, mid].astype(np.float32))
             if step % (every * 8) == 0:
                 s = stats[-1]
                 print(f"  step {step:>7,}  t/T {step / turnover:5.2f}  "
@@ -143,6 +153,8 @@ def main() -> None:
         reynolds_lambda=np.array([s.reynolds_lambda for s in stats]),
         taylor_microscale=np.array([s.taylor_microscale for s in stats]),
         nu_t_mean=np.array(nu_t_mean),
+        slices_enstrophy=np.array(snap_enstrophy),
+        slices_wz=np.array(snap_wz),
         ux=gx, uy=gy, uz=gz,
         n=n, nu=nu, reynolds=args.reynolds, smagorinsky=args.smagorinsky,
         u_rms=args.u_rms, turnover=turnover, k_peak=args.k_peak,

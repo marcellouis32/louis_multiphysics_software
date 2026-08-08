@@ -69,11 +69,13 @@ def contour_animation(
     label: str,
     norm,
     title: str = "",
+    subtitle: str = "",
     cmap=FLOW,
     n_filled: int = 28,
     n_lines: int = 14,
     solid: np.ndarray | None = None,
     extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+    labels: Sequence[str] | None = None,
     markers: Sequence[dict] | None = None,
     track: Sequence[tuple[float, float]] | None = None,
     converged: Sequence[bool] | None = None,
@@ -101,7 +103,7 @@ def contour_animation(
 
     mask = solid.astype(bool) if solid is not None else None
     filled = _levels_from_norm(norm, n_filled)
-    lines = _levels_from_norm(norm, n_lines)
+    lines = _levels_from_norm(norm, n_lines) if n_lines > 0 else None
 
     ny, nx = np.asarray(fields[0]).shape
     xs = np.linspace(extent[0], extent[1], nx)
@@ -130,10 +132,15 @@ def contour_animation(
                     _draw_markers(ax, markers[i])
 
                 ax.set_title(title)
-                caption = f"Re = {re:,.0f}"
+                # `labels` exists because this animator was written for Reynolds sweeps
+                # but the flow it is best suited to is genuinely time-dependent, where
+                # the frame index means elapsed time rather than a parameter value.
+                caption = labels[i] if labels is not None else f"Re = {re:,.0f}"
                 if converged is not None and not converged[i]:
                     caption += f"   ·   {cap_note}"
                 annotate(ax, caption, "lower left")
+                if subtitle:
+                    annotate(ax, subtitle, "lower right")
                 ax.set_xlabel("$x\\,/\\,L$")
                 ax.set_ylabel("$y\\,/\\,L$")
                 ax.set_xlim(extent[0], extent[1])

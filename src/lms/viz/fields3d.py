@@ -188,28 +188,49 @@ def plot_energy_spectra(
     subtitle: str = "",
     slope_guide: float = -5.0 / 3.0,
     guide_window: tuple[int, int] | None = None,
+    reference: str | None = None,
+    decades: float = 8.0,
     save: str | Path | None = None,
 ):
     """Log-log E(k) for several runs, with a Kolmogorov guide over a stated window.
 
-    `curves` maps a label to `(k, E)`. The guide line is drawn only across
-    `guide_window`, not the whole axis, because that window is the claim being made: at
-    these resolutions the inertial range spans a handful of wavenumbers, and a -5/3 line
-    stretched across the full spectrum implies a scaling range that does not exist.
+    `curves` maps a label to `(k, E)`. Three choices matter for readability:
+
+    `decades` clips the vertical range to a stated span below the peak. A resolved run
+    falls twelve decades by its Nyquist wavenumber, and letting the axis show all of it
+    compresses the energy-containing range -- the part anyone is actually reading -- into
+    the top fifth of the figure.
+
+    `reference` names the curve to draw as the baseline. It gets a pale, heavier line so
+    the eye can tell "the answer" from "the approximations to it" without consulting the
+    legend.
+
+    The guide is drawn only across `guide_window`, because that window is the claim being
+    made. A -5/3 line stretched over the whole axis asserts a scaling range that does not
+    exist at these resolutions.
     """
-    from lms.viz.style import ACCENT_WARM
+    from lms.viz.style import ACCENT_WARM, INK
 
     with house_style():
-        fig, ax = plt.subplots(figsize=(7.0, 5.4))
-        shades = plt.get_cmap(FLOW)(np.linspace(0.35, 0.92, max(len(curves), 1)))
+        fig, ax = plt.subplots(figsize=(7.2, 5.2))
+        others = [name for name in curves if name != reference]
+        shades = plt.get_cmap(FLOW)(np.linspace(0.45, 0.9, max(len(others), 1)))
+        colours = dict(zip(others, shades))
 
-        for (label, (k, e)), shade in zip(curves.items(), shades):
+        peak = 0.0
+        for label, (k, e) in curves.items():
             k = np.asarray(k, dtype=float)
             e = np.asarray(e, dtype=float)
             good = (k > 0) & (e > 0)
-            ax.loglog(k[good], e[good], "-", color=shade, linewidth=1.7, label=label)
+            peak = max(peak, float(e[good].max()) if good.any() else 0.0)
+            if label == reference:
+                ax.loglog(k[good], e[good], "-", color=INK, linewidth=2.6, alpha=0.55,
+                          label=f"{label}  (reference)", zorder=2)
+            else:
+                ax.loglog(k[good], e[good], "-", color=colours[label], linewidth=1.7,
+                          label=label, zorder=3)
 
-        if guide_window is not None:
+        if guide_window is not None and peak > 0:
             lo, hi = guide_window
             anchor_k, anchor_e = None, None
             for k, e in curves.values():
@@ -221,15 +242,20 @@ def plot_energy_spectra(
             if anchor_k is not None:
                 kk = np.linspace(lo, hi, 20)
                 ax.loglog(kk, anchor_e * (kk / anchor_k) ** slope_guide, "--",
-                          color=ACCENT_WARM, linewidth=1.2, alpha=0.9,
-                          label=f"$k^{{{slope_guide:.2f}}}$ over $k \\in [{lo}, {hi}]$")
+                          color=ACCENT_WARM, linewidth=1.3, alpha=0.9, zorder=4,
+                          label=f"$k^{{{slope_guide:.2f}}}$ over $k \\in [{lo},\\,{hi}]$")
+
+        if peak > 0:
+            ax.set_ylim(peak * 10.0**-decades, peak * 3.0)
 
         ax.set_xlabel("wavenumber $k$")
         ax.set_ylabel("$E(k)$")
-        ax.set_title(title)
+        ax.set_title(title, loc="left", pad=16)
         if subtitle:
-            annotate(ax, subtitle, "lower left")
-        ax.legend(loc="lower left", framealpha=0.0, fontsize=8.5)
+            ax.text(0.0, 1.015, subtitle, transform=ax.transAxes,
+                    fontsize=9, color=MUTED, ha="left", va="bottom")
+        # Lower left is where the spectra themselves end up; upper right is empty.
+        ax.legend(loc="upper right", framealpha=0.0, fontsize=8.5)
         fig.tight_layout()
         if save:
             fig.savefig(save)

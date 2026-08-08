@@ -18,10 +18,11 @@ import argparse
 from pathlib import Path
 
 import numpy as np
+from matplotlib.colors import PowerNorm
 
-from lms.validation.turbulence import inertial_slope
+from lms.validation.turbulence import enstrophy, inertial_slope
 from lms.viz.fields3d import plot_decay, plot_energy_spectra, plot_orthogonal_slices
-from lms.viz.style import DIVERGING_DARK, signed_asinh_norm
+from lms.viz.style import FLOW
 
 
 def load(path: Path) -> dict:
@@ -99,6 +100,7 @@ def main() -> None:
         title="Energy spectrum — coarse LES against a resolved run",
         subtitle=f"decaying isotropic turbulence   ·   t/T = {args.at:g}",
         guide_window=(lo, hi),
+        reference=reference["label"],
         save=out / "spectra.png",
     )
 
@@ -121,17 +123,17 @@ def main() -> None:
 
     # ------------------------------------------------------------------ slices
     for run in [reference, *coarse]:
-        ux, uy, uz = run["ux"], run["uy"], run["uz"]
-        wx = np.gradient(uz, axis=1) - np.gradient(uy, axis=2)
-        wy = np.gradient(ux, axis=2) - np.gradient(uz, axis=0)
-        wz = np.gradient(uy, axis=0) - np.gradient(ux, axis=1)
-        enstrophy = np.sqrt(wx**2 + wy**2 + wz**2)
+        omega = enstrophy(run["ux"], run["uy"], run["uz"])
+        # Sequential, not diverging. |omega| cannot be negative, so a map centred on
+        # zero would spend half its range on values that never occur and put the
+        # quiet regions -- most of the box -- on the neutral midpoint.
         plot_orthogonal_slices(
-            enstrophy, label=r"$|\omega|$",
+            omega, label=r"$|\omega|$",
             title=f"Vorticity magnitude — {run['label']}",
-            subtitle="decaying isotropic turbulence",
-            cmap=DIVERGING_DARK,
-            norm=signed_asinh_norm(enstrophy, percentile=99.0, linear_percentile=40.0),
+            subtitle="decaying isotropic turbulence   ·   three centre planes, shared scale",
+            cmap=FLOW,
+            norm=PowerNorm(gamma=0.55, vmin=0.0,
+                           vmax=float(np.percentile(omega, 99.5))),
             save=out / f"vorticity_{run['n']}_cs{run['cs']:g}.png",
         )
 
