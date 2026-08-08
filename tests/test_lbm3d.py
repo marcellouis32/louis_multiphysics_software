@@ -397,3 +397,141 @@ class TestConvergenceCriterion:
         assert state.converged
         assert state.stopped_on == "stagnation"
         assert state.steps < 60_000
+
+
+class TestSmagorinsky:
+    """LES changes the answer by design, so it cannot be checked against a laminar
+    exact solution the way Beltrami was. What *can* be pinned exactly is its input (the
+    strain rate), its off-switch (Cs = 0), and the wall-position invariant it threatens."""
+
+    N, U0, NU = 32, 0.05, 0.01
+
+    def _beltrami_solver(self, n=None, smagorinsky=0.0, nu=None):
+        """Velocity is scaled as 1/n -- diffusive, not acoustic.
+
+        Holding u0 fixed while refining pins the Mach number, which leaves the O(Ma^2)
+        compressibility error as a floor that refinement cannot cross, and any order
+        measured through it collapses toward first order. Phase 0 spent a week on this
+        in 2D; it applies just as much to a strain-rate convergence study.
+        """
+        from lms.lbm.d2q9 import viscosity_to_omega
+        from lms.lbm.solver3d import D3Q19Solver, init_backend
+        from lms.validation.beltrami import analytic, analytic_strain, nonequilibrium
+
+        n = n or self.N
+        nu = nu or self.NU
+        u0 = self.U0 * self.N / n
+        init_backend(prefer_gpu=False, precision="fp64")
+        omega = viscosity_to_omega(nu)
+        ux, uy, uz, rho = analytic(n, u0, nu, 0.0)
+        grad = analytic_strain(n, u0, nu, 0.0)
+        s = D3Q19Solver((n, n, n), omega=omega, solid=np.zeros((n, n, n), dtype=bool),
+                        smagorinsky=smagorinsky)
+        s.set_state(rho, ux, uy, uz, f_neq=nonequilibrium(rho, grad, 1.0 / omega))
+        return s, grad
+
+    def test_local_strain_matches_the_analytic_field(self):
+        """The model's input, recovered from the populations with no finite differences
+        via the Phase 1a identity. Second-order accurate, so the tolerance is set by
+        (k dx)^2 rather than by machine precision."""
+        s, grad = self._beltrami_solver()
+        exact = 0.5 * (grad + grad.transpose(1, 0, 2, 3, 4))
+        got = s.compute_strain()
+        scale = np.abs(exact).max()
+        for a in range(3):
+            for b in range(3):
+                assert np.abs(got[..., a, b] - exact[a, b]).max() / scale < 0.05
+
+    def test_strain_recovery_is_second_order(self):
+        """Distinguishes 'discretisation error' from 'bug'. A wrong moment contraction
+        would give a fixed relative error that refinement could not touch."""
+        errors = []
+        for n in (16, 32):
+            s, grad = self._beltrami_solver(n=n)
+            exact = 0.5 * (grad + grad.transpose(1, 0, 2, 3, 4))
+            got = s.compute_strain()
+            errors.append(
+                max(np.abs(got[..., a, b] - exact[a, b]).max() for a in range(3) for b in range(3))
+                / np.abs(exact).max()
+            )
+        order = np.log(errors[0] / errors[1]) / np.log(2.0)
+        assert 1.8 < order < 2.2, f"strain converged at order {order:.2f}"
+
+    def test_strain_is_symmetric(self):
+        s, _ = self._beltrami_solver()
+        got = s.compute_strain()
+        for a, b in ((0, 1), (0, 2), (1, 2)):
+            assert np.array_equal(got[..., a, b], got[..., b, a])
+
+    def test_cs_zero_produces_no_eddy_viscosity(self):
+        """The off-switch. Everything Phase 1a verified depends on this being exact."""
+        s, _ = self._beltrami_solver(smagorinsky=0.0)
+        for _ in range(10):
+            s.step()
+        assert np.all(s.eddy_viscosity() == 0.0)
+
+    def test_cs_zero_is_bit_identical_to_a_solver_built_without_les(self):
+        from lms.lbm.d2q9 import viscosity_to_omega
+        from lms.lbm.solver3d import init_backend, lid_driven_cavity_3d
+
+        init_backend(prefer_gpu=False, precision="fp64")
+        states = []
+        for smag in (0.0, None):
+            s = lid_driven_cavity_3d(n=20, nz=4, reynolds=100.0, lid_velocity=0.1)
+            if smag is not None:
+                s.smagorinsky = smag
+            states.append(s.run(max_steps=400, tol=0.0, check_every=400))
+        assert np.array_equal(states[0].ux, states[1].ux)
+        assert np.array_equal(states[0].uz, states[1].uz)
+        assert viscosity_to_omega(0.01) > 0  # sanity on the helper still being reachable
+
+    def test_eddy_viscosity_is_positive_and_varies_in_space(self):
+        """A constant eddy viscosity would mean the strain is not actually being read."""
+        s, _ = self._beltrami_solver(smagorinsky=0.1, nu=0.001)
+        for _ in range(20):
+            s.step()
+        nu_t = s.eddy_viscosity()
+        assert nu_t.min() >= 0.0
+        assert nu_t.max() > 0.0
+        assert nu_t.std() > 0.05 * nu_t.mean()
+
+    def test_eddy_viscosity_grows_with_the_smagorinsky_constant(self):
+        """Roughly as Cs^2, but deliberately not asserted as exactly Cs^2: the closure
+        is implicit, so a larger eddy viscosity raises tau, which lowers the strain it
+        reads back, which damps its own growth."""
+        means = []
+        for cs in (0.1, 0.2):
+            s, _ = self._beltrami_solver(smagorinsky=cs, nu=0.001)
+            for _ in range(20):
+                s.step()
+            means.append(s.eddy_viscosity().mean())
+        ratio = means[1] / means[0]
+        assert 3.0 < ratio < 4.0, f"nu_t grew by {ratio:.2f} for a 4x nominal increase"
+
+    def test_magic_parameter_holds_per_cell_under_varying_eddy_viscosity(self):
+        """The subtle one. Lambda = 1/4 is what pins the bounce-back wall halfway
+        between nodes independent of viscosity. LES makes tau vary per cell, so a single
+        scalar omega_minus would give every turbulent cell the wrong Lambda -- a wall
+        whose position depends on how turbulent the flow near it happens to be."""
+        from lms.lbm.d2q9 import trt_magic_omega, viscosity_to_omega
+        from lms.lbm.d3q19 import CS2
+
+        nu = 0.001
+        s, _ = self._beltrami_solver(smagorinsky=0.2, nu=nu)
+        for _ in range(20):
+            s.step()
+
+        tau_local = s.eddy_viscosity() / CS2 + 1.0 / viscosity_to_omega(nu)
+        assert tau_local.std() > 0, "eddy viscosity did not vary, so this proves nothing"
+        lam = (tau_local - 0.5) * (
+            1.0 / np.vectorize(trt_magic_omega)(1.0 / tau_local) - 0.5
+        )
+        assert np.allclose(lam, 0.25, atol=1e-12)
+
+    def test_negative_smagorinsky_constant_is_rejected(self):
+        from lms.lbm.solver3d import D3Q19Solver, init_backend
+
+        init_backend(prefer_gpu=False, precision="fp64")
+        with pytest.raises(ValueError, match="must be >= 0"):
+            D3Q19Solver((8, 8, 8), omega=1.8,
+                        solid=np.zeros((8, 8, 8), dtype=bool), smagorinsky=-0.1)

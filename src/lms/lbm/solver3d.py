@@ -114,6 +114,7 @@ class D3Q19Solver:
         solid: np.ndarray,
         collision: Literal["bgk", "trt"] = "trt",
         dtype=None,
+        smagorinsky: float = 0.0,
     ) -> None:
         ti = _taichi()
         self.ti = ti
@@ -122,6 +123,11 @@ class D3Q19Solver:
         self.collision = collision
         self.omega_plus = float(omega)
         self.omega_minus = trt_magic_omega(omega) if collision == "trt" else float(omega)
+        # 0.0 disables the model entirely and must reproduce the laminar solver exactly;
+        # that equivalence is the regression the whole LES path rests on.
+        self.smagorinsky = float(smagorinsky)
+        if self.smagorinsky < 0.0:
+            raise ValueError(f"smagorinsky constant must be >= 0, got {smagorinsky}")
 
         Q = d3q19.Q
 
@@ -136,6 +142,12 @@ class D3Q19Solver:
         self.vel = ti.Vector.field(3, self.dtype, shape=shape)
         self.solid = ti.field(ti.i32, shape=shape)
         self.wall_vel = ti.Vector.field(3, self.dtype, shape=shape)
+
+        # Eddy viscosity, written per step when LES is active. Diagnostic only -- the
+        # collision uses the local rate directly -- but it is what makes the model
+        # inspectable rather than a black box inside the kernel.
+        self.nu_t = ti.field(self.dtype, shape=shape)
+        self.nu_t.fill(0)
 
         self.solid.from_numpy(solid.astype(np.int32))
         self.wall_vel.fill(0)
@@ -153,6 +165,69 @@ class D3Q19Solver:
         nx, ny, nz = self.shape
         w_plus, w_minus = self.omega_plus, self.omega_minus
         is_trt = self.collision == "trt"
+        cs2 = d3q19.CS2
+        smag = self.smagorinsky
+        les_on = smag > 0.0
+
+        @ti.func
+        def q_norm(fneq):
+            """|Q| = sqrt(2 Q_ab Q_ab) where Q_ab = sum_i e_ia e_ib f_i^neq.
+
+            This is the second moment of the non-equilibrium populations, and Phase 1a
+            proved it equals -2 tau rho cs^2 S_ab. So the strain rate is available
+            *locally*: no finite differences, no neighbour access, no extra memory
+            traffic. It is the single best reason LES and LBM fit together.
+
+            Note it needs no tau, which is what lets the Smagorinsky closure below be
+            explicit rather than iterative.
+            """
+            qxx = 0.0
+            qyy = 0.0
+            qzz = 0.0
+            qxy = 0.0
+            qxz = 0.0
+            qyz = 0.0
+            for q in ti.static(range(Q)):
+                qxx += EX[q] * EX[q] * fneq[q]
+                qyy += EY[q] * EY[q] * fneq[q]
+                qzz += EZ[q] * EZ[q] * fneq[q]
+                qxy += EX[q] * EY[q] * fneq[q]
+                qxz += EX[q] * EZ[q] * fneq[q]
+                qyz += EY[q] * EZ[q] * fneq[q]
+            # Off-diagonals counted twice, since Q is symmetric.
+            return ti.sqrt(
+                2.0 * (qxx * qxx + qyy * qyy + qzz * qzz)
+                + 4.0 * (qxy * qxy + qxz * qxz + qyz * qyz)
+            )
+
+        @ti.func
+        def les_omega(rho, fneq):
+            """Local relaxation rate under the Smagorinsky closure.
+
+            The eddy viscosity depends on the strain, the strain depends on tau, and tau
+            depends on the eddy viscosity. The loop closes in one square root because
+            |Q| is tau-free (Hou et al. 1996):
+
+                tau = 0.5 [ tau_0 + sqrt(tau_0^2 + 18 Cs^2 |Q| / rho) ]
+            """
+            tau0 = 1.0 / w_plus
+            tau = 0.5 * (tau0 + ti.sqrt(tau0 * tau0 + 18.0 * smag * smag * q_norm(fneq) / rho))
+            return 1.0 / tau
+
+        @ti.func
+        def magic_partner(wp):
+            """Antisymmetric rate holding Lambda = (tau+ - 1/2)(tau- - 1/2) at 1/4.
+
+            Recomputed *per cell*, which is the whole point. Lambda = 1/4 is what pins
+            the bounce-back wall exactly halfway between nodes independent of viscosity;
+            Phase 0 established that letting it drift makes a case validated at one
+            Reynolds number degrade at another. LES makes tau vary per cell and per
+            step, so a single scalar omega_minus computed once would give every
+            turbulent cell the wrong Lambda -- a wall whose position depends on how
+            turbulent the flow near it happens to be.
+            """
+            tau_plus = 1.0 / wp
+            return 1.0 / (0.25 / (tau_plus - 0.5) + 0.5)
 
         @ti.func
         def feq_shifted(rho, u):
@@ -229,6 +304,17 @@ class D3Q19Solver:
 
                         # --- collide
                         eq = feq_shifted(r, u)
+
+                        # The w_i shifts cancel exactly in the difference, so this is
+                        # the true non-equilibrium part despite both terms being shifted.
+                        wp = w_plus
+                        wm = w_minus
+                        if ti.static(les_on):
+                            fneq = g - eq
+                            wp = les_omega(r, fneq)
+                            wm = magic_partner(wp) if ti.static(is_trt) else wp
+                            self.nu_t[i, j, k] = (1.0 / wp - 1.0 / w_plus) * cs2
+
                         out = ti.Vector.zero(self.dtype, Q)
                         if ti.static(is_trt):
                             for q in ti.static(range(Q)):
@@ -239,15 +325,57 @@ class D3Q19Solver:
                                 e_asym = 0.5 * (eq[q] - eq[qo])
                                 out[q] = (
                                     g[q]
-                                    - w_plus * (f_sym - e_sym)
-                                    - w_minus * (f_asym - e_asym)
+                                    - wp * (f_sym - e_sym)
+                                    - wm * (f_asym - e_asym)
                                 )
                         else:
                             for q in ti.static(range(Q)):
-                                out[q] = g[q] - w_plus * (g[q] - eq[q])
+                                out[q] = g[q] - wp * (g[q] - eq[q])
                         dst[i, j, k] = out
 
             return step_kernel
+
+        # Diagnostic: the full strain-rate tensor, six independent components in
+        # (xx, yy, zz, xy, xz, yz) order. Not used by the collision -- which needs only
+        # |Q| -- but it is what lets the local strain be checked against an analytic
+        # field, and that check is the only reason to trust the model's input.
+        strain = ti.Vector.field(6, self.dtype, shape=self.shape)
+
+        @ti.kernel
+        def strain_field():
+            for i, j, k in strain:
+                if self.solid[i, j, k] != 0:
+                    strain[i, j, k] = ti.Vector.zero(self.dtype, 6)
+                else:
+                    g = ti.Vector.zero(self.dtype, Q)
+                    for q in ti.static(range(Q)):
+                        si = (i - EX[q] + nx) % nx
+                        sj = (j - EY[q] + ny) % ny
+                        sk = (k - EZ[q] + nz) % nz
+                        g[q] = self.f[si, sj, sk][q]
+
+                    r = 1.0
+                    mx = 0.0
+                    my = 0.0
+                    mz = 0.0
+                    for q in ti.static(range(Q)):
+                        r += g[q]
+                        mx += EX[q] * g[q]
+                        my += EY[q] * g[q]
+                        mz += EZ[q] * g[q]
+                    fneq = g - feq_shifted(r, ti.Vector([mx / r, my / r, mz / r]))
+
+                    acc = ti.Vector.zero(self.dtype, 6)
+                    for q in ti.static(range(Q)):
+                        acc[0] += EX[q] * EX[q] * fneq[q]
+                        acc[1] += EY[q] * EY[q] * fneq[q]
+                        acc[2] += EZ[q] * EZ[q] * fneq[q]
+                        acc[3] += EX[q] * EY[q] * fneq[q]
+                        acc[4] += EX[q] * EZ[q] * fneq[q]
+                        acc[5] += EY[q] * EZ[q] * fneq[q]
+                    # S_ab = -Q_ab / (2 rho cs^2 tau), the Phase 1a identity inverted.
+                    scale = -1.0 / (2.0 * r * cs2 / w_plus)
+                    strain[i, j, k] = acc * scale
 
         # Closes over the field rather than taking it as an argument: this module uses
         # `from __future__ import annotations`, which turns every annotation into a
@@ -264,6 +392,8 @@ class D3Q19Solver:
         self._parity = 0
         self._speed_field = speed_field
         self._speed = speed
+        self._strain_field = strain_field
+        self._strain = strain
 
     # ------------------------------------------------------------------ api
 
@@ -343,6 +473,32 @@ class D3Q19Solver:
         f = self.f.to_numpy() if self._parity == 0 else self.f_new.to_numpy()
         # Stored shifted: real f = g + w_i, and the weights sum to one per node.
         return float(f.sum() + np.prod(self.shape))
+
+    def strain_rate(self) -> np.ndarray:
+        """Strain-rate tensor per cell, shape (nx, ny, nz, 3, 3).
+
+        Recovered from the populations via the Phase 1a identity
+        `sum_i e_ia e_ib f_i^neq = -2 tau rho cs^2 S_ab`, so it costs no finite
+        differences. Solid nodes report zero -- their populations are bounce-back state,
+        not a distribution a strain rate can be read from.
+        """
+        six = self._strain.to_numpy()
+        out = np.empty(self.shape + (3, 3), dtype=six.dtype)
+        xx, yy, zz, xy, xz, yz = (six[..., i] for i in range(6))
+        out[..., 0, 0], out[..., 1, 1], out[..., 2, 2] = xx, yy, zz
+        out[..., 0, 1] = out[..., 1, 0] = xy
+        out[..., 0, 2] = out[..., 2, 0] = xz
+        out[..., 1, 2] = out[..., 2, 1] = yz
+        return out
+
+    def compute_strain(self) -> np.ndarray:
+        """Run the diagnostic strain kernel and return the tensor."""
+        self._strain_field()
+        return self.strain_rate()
+
+    def eddy_viscosity(self) -> np.ndarray:
+        """Smagorinsky eddy viscosity from the most recent step. Zero when LES is off."""
+        return self.nu_t.to_numpy()
 
     def macroscopic(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         vel = self.vel.to_numpy()
