@@ -76,6 +76,7 @@ def main() -> None:
     p.add_argument("--lid-velocity", type=float, default=0.1)
     p.add_argument("--spans", type=float, nargs="+", default=[1.0, 2.0, 3.0],
                    help="span / cavity width")
+    p.add_argument("--collision", choices=["bgk", "trt", "regularized"], default="trt")
     p.add_argument("--tol", type=float, default=1e-6)
     p.add_argument("--max-steps", type=int, default=200_000)
     p.add_argument("--out", type=Path, default=Path("runs/cavity3d"))
@@ -89,7 +90,7 @@ def main() -> None:
     length = args.n - 2
 
     print(f"3D lid-driven cavity  {args.n}^2 cross-section  Re = {args.reynolds:g}  "
-          f"U = {args.lid_velocity}  ({arch} fp32)")
+          f"U = {args.lid_velocity}  {args.collision.upper()}  ({arch} fp32)")
     print("Ghia et al. is a *2D* reference. The mid-plane must approach it as the span")
     print("grows; at span = 1 the gap is the end-wall effect, not solver error.\n")
     print(f"{'span':>6} {'nz':>5} {'cells':>9} {'steps':>8} {'stopped on':>10} "
@@ -100,7 +101,7 @@ def main() -> None:
         nz = round(span * length) + 2
         solver = lid_driven_cavity_3d(
             n=args.n, nz=nz, reynolds=args.reynolds,
-            lid_velocity=args.lid_velocity, collision="trt", periodic_z=False,
+            lid_velocity=args.lid_velocity, collision=args.collision, periodic_z=False,
         )
         t0 = time.perf_counter()
         state = solver.run(max_steps=args.max_steps, tol=args.tol, check_every=1000)
@@ -117,7 +118,7 @@ def main() -> None:
               f"{sym_x:>9.2e} {sym_z:>9.2e} {elapsed:>6.0f}s")
 
         np.savez_compressed(
-            args.out / f"cavity3d_re{int(args.reynolds)}_n{args.n}_span{span:g}.npz",
+            args.out / f"cavity3d_re{int(args.reynolds)}_n{args.n}_span{span:g}_{args.collision}.npz",
             ux=state.ux, uy=state.uy, uz=state.uz, rho=state.rho,
             solid=solver.solid.to_numpy(), reynolds=args.reynolds,
             lid_velocity=args.lid_velocity, span=span, steps=state.steps,

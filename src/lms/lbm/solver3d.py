@@ -112,7 +112,7 @@ class D3Q19Solver:
         shape: tuple[int, int, int],
         omega: float,
         solid: np.ndarray,
-        collision: Literal["bgk", "trt"] = "trt",
+        collision: Literal["bgk", "trt", "regularized"] = "trt",
         dtype=None,
         smagorinsky: float = 0.0,
     ) -> None:
@@ -123,6 +123,10 @@ class D3Q19Solver:
         self.collision = collision
         self.omega_plus = float(omega)
         self.omega_minus = trt_magic_omega(omega) if collision == "trt" else float(omega)
+        if collision not in ("bgk", "trt", "regularized"):
+            raise ValueError(
+                f"collision must be bgk, trt or regularized, got {collision!r}"
+            )
         # 0.0 disables the model entirely and must reproduce the laminar solver exactly;
         # that equivalence is the regression the whole LES path rests on.
         self.smagorinsky = float(smagorinsky)
@@ -165,6 +169,7 @@ class D3Q19Solver:
         nx, ny, nz = self.shape
         w_plus, w_minus = self.omega_plus, self.omega_minus
         is_trt = self.collision == "trt"
+        is_regularized = self.collision == "regularized"
         cs2 = d3q19.CS2
         smag = self.smagorinsky
         les_on = smag > 0.0
@@ -316,7 +321,35 @@ class D3Q19Solver:
                             self.nu_t[i, j, k] = (1.0 / wp - 1.0 / w_plus) * cs2
 
                         out = ti.Vector.zero(self.dtype, Q)
-                        if ti.static(is_trt):
+                        if ti.static(is_regularized):
+                            # Rebuild the whole non-equilibrium part from its momentum
+                            # flux, discarding every higher Hermite moment. Those ghost
+                            # modes carry no hydrodynamics but do carry the instability
+                            # that kills LBM as tau approaches 1/2.
+                            pxx = 0.0; pyy = 0.0; pzz = 0.0
+                            pxy = 0.0; pxz = 0.0; pyz = 0.0
+                            for q in ti.static(range(Q)):
+                                d = g[q] - eq[q]
+                                pxx += EX[q] * EX[q] * d
+                                pyy += EY[q] * EY[q] * d
+                                pzz += EZ[q] * EZ[q] * d
+                                pxy += EX[q] * EY[q] * d
+                                pxz += EX[q] * EZ[q] * d
+                                pyz += EY[q] * EZ[q] * d
+                            for q in ti.static(range(Q)):
+                                # Off-diagonal terms appear twice in the contraction
+                                # because Pi is symmetric, hence the factor of two.
+                                contraction = (
+                                    (EX[q] * EX[q] - cs2) * pxx
+                                    + (EY[q] * EY[q] - cs2) * pyy
+                                    + (EZ[q] * EZ[q] - cs2) * pzz
+                                    + 2.0 * EX[q] * EY[q] * pxy
+                                    + 2.0 * EX[q] * EZ[q] * pxz
+                                    + 2.0 * EY[q] * EZ[q] * pyz
+                                )
+                                reg = W[q] / (2.0 * cs2 * cs2) * contraction
+                                out[q] = eq[q] + (1.0 - wp) * reg
+                        elif ti.static(is_trt):
                             for q in ti.static(range(Q)):
                                 qo = OPP[q]
                                 f_sym = 0.5 * (g[q] + g[qo])
@@ -611,7 +644,7 @@ def lid_driven_cavity_3d(
     nz: int = 4,
     reynolds: float = 1000.0,
     lid_velocity: float = 0.1,
-    collision: Literal["bgk", "trt"] = "trt",
+    collision: Literal["bgk", "trt", "regularized"] = "trt",
     periodic_z: bool = True,
 ) -> D3Q19Solver:
     """The Phase 0 cavity, extruded along z.

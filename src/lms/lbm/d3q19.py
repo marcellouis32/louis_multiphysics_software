@@ -66,3 +66,53 @@ def macroscopic(
     uy = np.tensordot(EY.astype(f.dtype), f, axes=(0, 0)) / rho
     uz = np.tensordot(EZ.astype(f.dtype), f, axes=(0, 0)) / rho
     return rho, ux, uy, uz
+
+
+def momentum_flux(f_neq: np.ndarray) -> np.ndarray:
+    """Non-equilibrium momentum flux `Pi_ab = sum_i e_ia e_ib f_i^neq`.
+
+    Shape (3, 3, ...) and symmetric by construction. This is the only part of the
+    non-equilibrium distribution that carries hydrodynamics -- it is the viscous stress.
+    """
+    e = np.stack([EX, EY, EZ]).astype(f_neq.dtype)
+    out = np.empty((3, 3) + f_neq.shape[1:], dtype=f_neq.dtype)
+    for a in range(3):
+        for b in range(3):
+            out[a, b] = np.tensordot(e[a] * e[b], f_neq, axes=(0, 0))
+    return out
+
+
+def regularize(f_neq: np.ndarray) -> np.ndarray:
+    """Project the non-equilibrium populations onto the second-order Hermite basis.
+
+    Latt & Chopard (2006). The whole non-equilibrium part is rebuilt from its momentum
+    flux alone:
+
+        f_i^neq,reg = (w_i / 2 cs^4) (e_ia e_ib - cs^2 delta_ab) Pi_ab
+
+    Everything beyond the second Hermite moment is discarded. Those discarded pieces are
+    the ghost modes: they carry no hydrodynamics but do carry the instability that makes
+    LBM fail as tau approaches 1/2, so throwing them away each step costs nothing
+    physical and buys stability at low viscosity.
+
+    Three properties make this a projection rather than a fudge, and all three are
+    asserted in the tests: it is idempotent, it preserves `Pi_ab` exactly, and it leaves
+    mass and momentum untouched.
+
+    One consequence worth knowing before using it near a wall: `e_ia e_ib` is even under
+    `i -> OPPOSITE[i]`, so the reconstruction is purely symmetric and the antisymmetric
+    part of `f_neq` is set to zero. That is the part TRT's magic parameter relaxes, so a
+    regularized collision does not pin the bounce-back wall the way TRT does.
+    """
+    pi = momentum_flux(f_neq)
+    e = np.stack([EX, EY, EZ]).astype(f_neq.dtype)
+
+    out = np.empty_like(f_neq)
+    for i in range(Q):
+        acc = np.zeros(f_neq.shape[1:], dtype=f_neq.dtype)
+        for a in range(3):
+            for b in range(3):
+                q = e[a, i] * e[b, i] - (CS2 if a == b else 0.0)
+                acc = acc + q * pi[a, b]
+        out[i] = W[i] / (2.0 * CS2 * CS2) * acc
+    return out

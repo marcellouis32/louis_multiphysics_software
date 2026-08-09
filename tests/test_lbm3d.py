@@ -535,3 +535,74 @@ class TestSmagorinsky:
         with pytest.raises(ValueError, match="must be >= 0"):
             D3Q19Solver((8, 8, 8), omega=1.8,
                         solid=np.zeros((8, 8, 8), dtype=bool), smagorinsky=-0.1)
+
+
+class TestRegularization:
+    """The Hermite projection, pinned by algebra rather than by simulation.
+
+    Regularization discards everything in the non-equilibrium populations beyond the
+    second Hermite moment. If it discarded any of the hydrodynamics too, the solver
+    would still run and would be quietly wrong about viscosity -- so every conserved
+    property is asserted directly.
+    """
+
+    @staticmethod
+    def _arbitrary_fneq(shape=(4, 5, 6), seed=0):
+        """A non-equilibrium part is traceless in mass; nothing else is assumed, so the
+        projection is exercised on a genuinely general input rather than one already
+        living in the subspace it projects onto."""
+        f = np.random.default_rng(seed).standard_normal((d3q19.Q,) + shape)
+        return f - f.sum(axis=0) / d3q19.Q
+
+    def test_is_idempotent(self):
+        """A projection applied twice equals a projection applied once."""
+        f = self._arbitrary_fneq()
+        once = d3q19.regularize(f)
+        twice = d3q19.regularize(once)
+        assert np.abs(twice - once).max() < 1e-14
+
+    def test_preserves_the_momentum_flux(self):
+        """Pi_ab is the viscous stress. Changing it would change the viscosity, which is
+        the one thing the collision operator must not do."""
+        f = self._arbitrary_fneq()
+        before = d3q19.momentum_flux(f)
+        after = d3q19.momentum_flux(d3q19.regularize(f))
+        assert np.abs(after - before).max() < 1e-14
+
+    def test_leaves_mass_and_momentum_untouched(self):
+        f = self._arbitrary_fneq()
+        reg = d3q19.regularize(f)
+        assert np.abs(reg.sum(axis=0)).max() < 1e-14
+        for e in (d3q19.EX, d3q19.EY, d3q19.EZ):
+            moment = np.tensordot(e.astype(float), reg, axes=(0, 0))
+            assert np.abs(moment).max() < 1e-14
+
+    def test_is_the_identity_on_an_already_hermite_input(self):
+        """The strongest check, and it costs nothing: `beltrami.nonequilibrium` builds
+        exactly the second-order Hermite form, so projecting it must change nothing.
+        Phase 1b's verified machinery is a free oracle here."""
+        from lms.lbm.d2q9 import viscosity_to_omega
+        from lms.validation.beltrami import analytic, analytic_strain, nonequilibrium
+
+        n, u0, nu = 16, 0.05, 0.01
+        tau = 1.0 / viscosity_to_omega(nu)
+        *_, rho = analytic(n, u0, nu, 0.0)
+        fneq = nonequilibrium(rho, analytic_strain(n, u0, nu, 0.0), tau)
+
+        assert np.abs(d3q19.regularize(fneq) - fneq).max() == 0.0
+
+    def test_actually_discards_something(self):
+        """Guards against the projection silently degenerating into the identity. A
+        general input carries ghost modes; if this ever returns zero the operator has
+        stopped doing anything and the stability gain is imaginary."""
+        f = self._arbitrary_fneq()
+        ghost = f - d3q19.regularize(f)
+        assert np.linalg.norm(ghost) / np.linalg.norm(f) > 0.1
+
+    def test_reconstruction_is_symmetric_under_opposite(self):
+        """e_ia e_ib is even under i -> OPPOSITE[i], so the regularized populations carry
+        no antisymmetric part. This is not a defect but it is a consequence with teeth:
+        the antisymmetric part is what TRT's magic parameter relaxes, so a regularized
+        collision cannot pin the bounce-back wall the way TRT does."""
+        reg = d3q19.regularize(self._arbitrary_fneq())
+        assert np.abs(reg - reg[d3q19.OPPOSITE]).max() < 1e-14
