@@ -199,4 +199,93 @@ def track_overlay(
     )
 
 
-__all__ = ["contour_animation", "pooled_norm", "track_overlay"]
+__all__ = [
+    "contour_animation",
+    "pooled_norm",
+    "side_by_side_animation",
+    "track_overlay",
+]
+
+
+def side_by_side_animation(
+    left: Sequence[np.ndarray],
+    right: Sequence[np.ndarray],
+    titles: tuple[str, str],
+    label: str,
+    norm,
+    captions: Sequence[str] | None = None,
+    dead_after: tuple[int | None, int | None] = (None, None),
+    dead_note: str = "diverged",
+    title: str = "",
+    subtitle: str = "",
+    cmap=FLOW,
+    n_filled: int = 44,
+    n_lines: int = 0,
+    extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
+    fps: int = 8,
+    dpi: int = 92,
+    figsize: tuple[float, float] = (10.4, 5.4),
+    save: str | Path = "compare.gif",
+) -> Path:
+    """Two runs of the same problem, frame-synchronised on one shared colour scale.
+
+    Built for the comparison where one run survives and the other does not, which brings
+    two obligations that a naive implementation gets wrong in a flattering direction.
+
+    **One norm across both panels, frozen.** A diverging run reaches enormous velocities,
+    so per-panel scaling would render the blow-up as calm and the healthy run as violent
+    -- exactly backwards. The norm must be fitted to the *surviving* run, not pooled over
+    both, or the failure's excursion sets a scale on which everything real looks flat.
+
+    **A dead run stops, visibly.** `dead_after` gives the last valid frame index for each
+    panel; past it the panel is left blank and captioned. Rendering NaN as a colour, or
+    letting the animation quietly continue with stale data, turns a measured divergence
+    into a visual shrug.
+    """
+    frames = max(len(left), len(right))
+    save = Path(save)
+    save.parent.mkdir(parents=True, exist_ok=True)
+    filled = _levels_from_norm(norm, n_filled)
+    lines = _levels_from_norm(norm, n_lines) if n_lines > 0 else None
+
+    with house_style(), mpl.rc_context({"savefig.bbox": None}):
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), list(axes), label)
+        fig.subplots_adjust(left=0.06, right=0.88, bottom=0.08, top=0.86, wspace=0.18)
+
+        writer = PillowWriter(fps=fps)
+        with writer.saving(fig, str(save), dpi=dpi):
+            for i in range(frames):
+                for ax, series, name, last in zip(
+                    axes, (left, right), titles, dead_after
+                ):
+                    ax.clear()
+                    alive = i < len(series) and (last is None or i <= last)
+                    if alive:
+                        data = np.asarray(series[i])
+                        ny, nx = data.shape
+                        xs = np.linspace(extent[0], extent[1], nx)
+                        ys = np.linspace(extent[2], extent[3], ny)
+                        _draw_contour_layers(
+                            ax, xs, ys, np.ma.asarray(data), filled, lines, cmap, norm
+                        )
+                        ax.set_title(name, loc="left")
+                    else:
+                        ax.set_title(f"{name} — {dead_note}", loc="left", color=ACCENT_WARM)
+                        ax.text(0.5, 0.5, dead_note, transform=ax.transAxes,
+                                ha="center", va="center", color=ACCENT_WARM, fontsize=13)
+                    ax.set_xlim(extent[0], extent[1])
+                    ax.set_ylim(extent[2], extent[3])
+                    ax.set_xticks([]); ax.set_yticks([])
+                    ax.set_aspect("equal")
+                    ax.grid(False)
+
+                if captions is not None and i < len(captions):
+                    annotate(axes[0], captions[i], "lower left")
+                if subtitle:
+                    annotate(axes[1], subtitle, "lower right")
+                fig.suptitle(title, x=0.012, ha="left", fontsize=12.5, weight="bold")
+                writer.grab_frame()
+
+        plt.close(fig)
+    return save

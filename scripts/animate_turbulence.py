@@ -73,9 +73,13 @@ def main() -> None:
     # ------------------------------------------------------------- enstrophy
     # Sequential: |omega| is non-negative, so a diverging map would waste half its range
     # and put the quiet majority of the box on the neutral midpoint.
+    # 99.9 rather than the 99.5 used for the cavity. Turbulence is far more
+    # intermittent than a laminar recirculation: the rare intense filaments are the
+    # structure worth seeing, and clipping at 99.5 saturates them into featureless
+    # patches. The cost is that half a percent of cells clip instead of a tenth.
     ens_norm = pooled_norm(
         enstrophy,
-        lambda pool: PowerNorm(gamma=0.55, vmin=0.0, vmax=float(np.percentile(pool, 99.5))),
+        lambda pool: PowerNorm(gamma=0.6, vmin=0.0, vmax=float(np.percentile(pool, 99.9))),
     )
     path = contour_animation(
         enstrophy, reynolds=list(times), labels=captions,
