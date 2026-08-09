@@ -363,6 +363,13 @@ Phase 1 is the 3D GPU port: D3Q19, MRT or cumulant collision, Smagorinsky LES, S
 voxelisation, and an immersed boundary for the rotating impeller — ending at the Rushton
 power number milestone, $N_p$ within ~10 % of the published 4.8–5.5.
 
+> **What actually happened** — see [phase1.md](phase1.md). Phase 1 was cut short of that
+> milestone on purpose. It delivered D3Q19 on the GPU, Smagorinsky LES and a regularized
+> collision operator, and stopped there: a solver core is one coherent thing to verify and
+> write up, whereas geometry, an immersed boundary and a rotating impeller are a different
+> kind of work and became Phase 2. MRT was never written — the measurement that was
+> supposed to justify it showed regularization sufficed.
+
 ---
 
 ## Reproducing
