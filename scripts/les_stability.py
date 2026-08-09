@@ -29,12 +29,12 @@ from lms.validation.turbulence import solenoidal_field, statistics
 
 
 def attempt(n: int, reynolds: float, smagorinsky: float, u_rms: float,
-            k_peak: float, steps: int, seed: int = 0):
+            k_peak: float, steps: int, seed: int = 0, collision: str = "trt"):
     """Run briefly and report survival plus the turbulence level reached."""
     nu = u_rms * n / reynolds
     solver = D3Q19Solver(
         (n, n, n), omega=viscosity_to_omega(nu), solid=np.zeros((n, n, n), dtype=bool),
-        collision="trt", smagorinsky=smagorinsky,
+        collision=collision, smagorinsky=smagorinsky,
     )
     ux, uy, uz = solenoidal_field(n, u_rms=u_rms, k_peak=k_peak, seed=seed)
     solver.set_state(np.ones((n, n, n)), ux, uy, uz)
@@ -59,10 +59,12 @@ def main() -> None:
     p.add_argument("--reynolds", type=float, nargs="+",
                    default=[500, 1000, 2000, 4000, 8000, 16000, 32000])
     p.add_argument("--cs", type=float, nargs="+", default=[0.0, 0.1, 0.17])
+    p.add_argument("--collision", choices=["bgk", "trt", "regularized"], default="trt")
     args = p.parse_args()
 
     arch, _ = init_backend(prefer_gpu=True, precision="fp32")
-    print(f"TRT stability sweep  {args.n}^3  ({arch} fp32)  {args.steps:,} steps per case")
+    print(f"{args.collision.upper()} stability sweep  {args.n}^3  ({arch} fp32)  "
+          f"{args.steps:,} steps per case")
     print(f"u_rms = {args.u_rms}   k_peak = {args.k_peak:g}\n")
 
     header = f"{'Re':>8} {'nu':>9} {'tau':>8}"
@@ -75,7 +77,8 @@ def main() -> None:
         row = f"{re:>8.0f} {nu:>9.2e} {3 * nu + 0.5:>8.4f}"
         for cs in args.cs:
             ok, step, re_lambda, _ = attempt(
-                args.n, re, cs, args.u_rms, args.k_peak, args.steps
+                args.n, re, cs, args.u_rms, args.k_peak, args.steps,
+                collision=args.collision,
             )
             cell = f"Re_l {re_lambda:5.1f}" if ok else f"died @{step:,}"
             row += f" {cell:>18}"

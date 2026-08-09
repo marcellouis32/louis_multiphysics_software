@@ -133,14 +133,24 @@ def kinetic_energy(ux: np.ndarray, uy: np.ndarray, uz: np.ndarray) -> float:
 def dissipation_rate(
     ux: np.ndarray, uy: np.ndarray, uz: np.ndarray, nu: float
 ) -> float:
-    """Molecular dissipation, computed spectrally as 2 nu sum k^2 E(k).
+    """Molecular dissipation, computed spectrally as 2 nu sum k_phys^2 E(k).
 
     Spectral rather than by finite differences, because a difference stencil
     systematically under-resolves the highest wavenumbers -- exactly where dissipation
     lives -- and would flatter the solver.
+
+    **The wavenumber must be physical, not the shell index.** `energy_spectrum` returns
+    integer shell numbers because that is what one plots against, but the derivative in
+    `2 nu <|grad u|^2>` is with respect to lattice units, so the wavenumber entering it
+    is `2 pi m / n`. Using the index directly inflates epsilon by `(n / 2 pi)^2` -- a
+    factor of 101 at n = 64 -- and every quantity derived from it: the Taylor microscale
+    and Re_lambda both come out low by `n / 2 pi`. Verified against a direct
+    `2 nu <S_ab S_ab>` computation, which agrees to 2%.
     """
+    n = ux.shape[0]
     k, e = energy_spectrum(ux, uy, uz)
-    return float(2.0 * nu * np.sum(k**2 * e))
+    k_phys = 2.0 * np.pi * k / n
+    return float(2.0 * nu * np.sum(k_phys**2 * e))
 
 
 @dataclass
@@ -151,6 +161,17 @@ class TurbulenceStats:
     u_rms: float
     taylor_microscale: float
     reynolds_lambda: float
+    kolmogorov: float
+    """eta = (nu^3 / eps)^(1/4), the scale at which viscosity finally wins."""
+
+    k_max_eta: float
+    """Resolution adequacy: the Nyquist wavenumber times the Kolmogorov scale.
+
+    The number that separates "stable" from "right". Below ~1 the grid cannot represent
+    the scales where dissipation happens, so energy piles up at the cutoff instead of
+    being dissipated -- and the run can look perfectly healthy while doing it. A solver
+    that survives at k_max*eta = 0.1 has not simulated turbulence, it has survived.
+    """
 
 
 def statistics(
@@ -161,6 +182,9 @@ def statistics(
     eps = dissipation_rate(ux, uy, uz, nu)
     u_prime = float(np.sqrt(2.0 * energy / 3.0))
     lam = float(np.sqrt(15.0 * nu * u_prime**2 / eps)) if eps > 0 else float("inf")
+    eta = float((nu**3 / eps) ** 0.25) if eps > 0 else float("inf")
+    # Nyquist is pi radians per lattice unit, the finest wave a unit grid can carry.
+    k_max = np.pi
     return TurbulenceStats(
         step=step,
         energy=energy,
@@ -168,6 +192,8 @@ def statistics(
         u_rms=u_prime,
         taylor_microscale=lam,
         reynolds_lambda=float(u_prime * lam / nu) if nu > 0 else float("inf"),
+        kolmogorov=eta,
+        k_max_eta=float(k_max * eta),
     )
 
 

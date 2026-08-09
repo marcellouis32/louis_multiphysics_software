@@ -176,3 +176,50 @@ class TestVorticity:
         from lms.validation.turbulence import enstrophy
 
         assert enstrophy(*field).min() >= 0.0
+
+
+class TestDissipationScaling:
+    """The dissipation rate sets the Taylor microscale, Re_lambda and the Kolmogorov
+    scale, so an error in it silently mis-states how turbulent a run was."""
+
+    def test_matches_a_direct_strain_rate_computation(self):
+        """Independent route to the same number: eps = 2 nu <S_ab S_ab>, with exact
+        spectral derivatives. Agreement to a few percent (shell binning is the residual)
+        is what pins the wavenumber convention."""
+        from lms.validation.turbulence import dissipation_rate, solenoidal_field
+
+        n, nu = 64, 0.01
+        ux, uy, uz = solenoidal_field(n, u_rms=0.05, k_peak=4.0, seed=0)
+
+        k1 = np.fft.fftfreq(n) * n
+        kx, ky, kz = np.meshgrid(k1, k1, k1, indexing="ij")
+        scale = 2 * np.pi / n
+        hats = [np.fft.fftn(c) for c in (ux, uy, uz)]
+        comps = [kx, ky, kz]
+
+        direct = 0.0
+        for a in range(3):
+            for b in range(3):
+                dab = np.fft.ifftn(1j * comps[a] * scale * hats[b])
+                dba = np.fft.ifftn(1j * comps[b] * scale * hats[a])
+                strain = 0.5 * np.real(dab + dba)
+                direct += 2 * nu * np.mean(strain * strain)
+
+        assert dissipation_rate(ux, uy, uz, nu) == pytest.approx(direct, rel=0.05)
+
+    def test_uses_physical_wavenumbers_not_shell_indices(self):
+        """The specific bug this guards: using the integer shell index inflates epsilon
+        by (n / 2 pi)^2 -- 101x at n = 64 -- and drags Re_lambda down by n / 2 pi."""
+        from lms.validation.turbulence import (
+            dissipation_rate,
+            energy_spectrum,
+            solenoidal_field,
+        )
+
+        n, nu = 64, 0.01
+        ux, uy, uz = solenoidal_field(n, u_rms=0.05, seed=0)
+        k, e = energy_spectrum(ux, uy, uz)
+        naive = 2.0 * nu * np.sum(k**2 * e)
+
+        ratio = naive / dissipation_rate(ux, uy, uz, nu)
+        assert ratio == pytest.approx((n / (2 * np.pi)) ** 2, rel=1e-9)

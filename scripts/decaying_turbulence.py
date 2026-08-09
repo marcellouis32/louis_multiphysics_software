@@ -57,6 +57,8 @@ def main() -> None:
     p.add_argument("--u-rms", type=float, default=0.05)
     p.add_argument("--k-peak", type=float, default=4.0)
     p.add_argument("--smagorinsky", type=float, default=0.0)
+    p.add_argument("--collision", choices=["bgk", "trt", "regularized"],
+                   default="trt")
     p.add_argument("--turnovers", type=float, default=4.0)
     p.add_argument("--samples", type=int, default=40)
     p.add_argument("--seed", type=int, default=0)
@@ -73,11 +75,11 @@ def main() -> None:
     every = max(total_steps // args.samples, 1)
 
     arch, _ = init_backend(prefer_gpu=not args.cpu, precision="fp32" if not args.cpu else "fp64")
-    tag = f"n{n}_re{int(args.reynolds)}_cs{args.smagorinsky:g}"
+    tag = f"n{n}_re{int(args.reynolds)}_cs{args.smagorinsky:g}_{args.collision}"
 
     print(f"decaying isotropic turbulence  {n}^3  ({arch})")
     print(f"  Re = {args.reynolds:g}   nu = {nu:.5f}   tau = {tau:.4f}   "
-          f"Cs = {args.smagorinsky:g}")
+          f"Cs = {args.smagorinsky:g}   {args.collision.upper()}")
     print(f"  u_rms = {args.u_rms}   k_peak = {args.k_peak:g}   "
           f"turnover = {turnover:,.0f} steps")
     if tau < 0.51:
@@ -101,7 +103,7 @@ def main() -> None:
     rho = np.ones((n, n, n))
     solver = D3Q19Solver(
         (n, n, n), omega=viscosity_to_omega(nu), solid=np.zeros((n, n, n), dtype=bool),
-        collision="trt", smagorinsky=args.smagorinsky,
+        collision=args.collision, smagorinsky=args.smagorinsky,
     )
     solver.set_state(rho, ux, uy, uz)
 
@@ -130,7 +132,8 @@ def main() -> None:
                 s = stats[-1]
                 print(f"  step {step:>7,}  t/T {step / turnover:5.2f}  "
                       f"E {s.energy:.4e}  eps {s.dissipation:.3e}  "
-                      f"Re_lambda {s.reynolds_lambda:6.1f}  nu_t/nu {nu_t_mean[-1] / nu:5.2f}")
+                      f"Re_lambda {s.reynolds_lambda:6.1f}  k_max*eta {s.k_max_eta:5.2f}  "
+                      f"nu_t/nu {nu_t_mean[-1] / nu:5.2f}")
         if step < total_steps:
             solver.step()
 
@@ -151,6 +154,7 @@ def main() -> None:
         energy=energies,
         dissipation=np.array([s.dissipation for s in stats]),
         reynolds_lambda=np.array([s.reynolds_lambda for s in stats]),
+        k_max_eta=np.array([s.k_max_eta for s in stats]),
         taylor_microscale=np.array([s.taylor_microscale for s in stats]),
         nu_t_mean=np.array(nu_t_mean),
         slices_enstrophy=np.array(snap_enstrophy),
