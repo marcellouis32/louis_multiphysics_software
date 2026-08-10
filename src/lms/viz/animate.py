@@ -213,6 +213,9 @@ def side_by_side_animation(
     titles: tuple[str, str],
     label: str,
     norm,
+    right_norm=None,
+    right_cmap=None,
+    right_label: str | None = None,
     captions: Sequence[str] | None = None,
     dead_after: tuple[int | None, int | None] = (None, None),
     dead_note: str = "diverged",
@@ -241,24 +244,45 @@ def side_by_side_animation(
     panel; past it the panel is left blank and captioned. Rendering NaN as a colour, or
     letting the animation quietly continue with stale data, turns a measured divergence
     into a visual shrug.
+
+    `right_norm`/`right_cmap`/`right_label` switch the panels from same-quantity
+    comparison (one shared scale, one colorbar -- the stability animation) to
+    different-quantity synchrony (speed beside dye), where sharing a scale would be
+    the error: each panel then gets its own frozen norm, colormap and colorbar, and
+    the colormaps should differ so the quantities are never confusable.
     """
     frames = max(len(left), len(right))
     save = Path(save)
     save.parent.mkdir(parents=True, exist_ok=True)
-    filled = _levels_from_norm(norm, n_filled)
-    lines = _levels_from_norm(norm, n_lines) if n_lines > 0 else None
+    two_scales = right_norm is not None
+    norms = (norm, right_norm if two_scales else norm)
+    cmaps = (cmap, right_cmap if two_scales else cmap)
+    filled = tuple(_levels_from_norm(nm, n_filled) for nm in norms)
+    lines = tuple(
+        _levels_from_norm(nm, n_lines) if n_lines > 0 else None for nm in norms
+    )
 
     with house_style(), mpl.rc_context({"savefig.bbox": None}):
         fig, axes = plt.subplots(1, 2, figsize=figsize)
-        colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), list(axes), label)
-        fig.subplots_adjust(left=0.06, right=0.88, bottom=0.08, top=0.86, wspace=0.18)
+        if two_scales:
+            colorbar(fig, plt.cm.ScalarMappable(norm=norms[0], cmap=cmaps[0]),
+                     [axes[0]], label)
+            colorbar(fig, plt.cm.ScalarMappable(norm=norms[1], cmap=cmaps[1]),
+                     [axes[1]], right_label or "")
+            fig.subplots_adjust(left=0.05, right=0.92, bottom=0.08, top=0.86,
+                                wspace=0.32)
+        else:
+            colorbar(fig, plt.cm.ScalarMappable(norm=norm, cmap=cmap), list(axes),
+                     label)
+            fig.subplots_adjust(left=0.06, right=0.88, bottom=0.08, top=0.86,
+                                wspace=0.18)
 
         writer = PillowWriter(fps=fps)
         with writer.saving(fig, str(save), dpi=dpi):
             for i in range(frames):
-                for ax, series, name, last in zip(
+                for panel, (ax, series, name, last) in enumerate(zip(
                     axes, (left, right), titles, dead_after
-                ):
+                )):
                     ax.clear()
                     alive = i < len(series) and (last is None or i <= last)
                     if alive:
@@ -267,7 +291,8 @@ def side_by_side_animation(
                         xs = np.linspace(extent[0], extent[1], nx)
                         ys = np.linspace(extent[2], extent[3], ny)
                         _draw_contour_layers(
-                            ax, xs, ys, np.ma.asarray(data), filled, lines, cmap, norm
+                            ax, xs, ys, np.ma.asarray(data), filled[panel],
+                            lines[panel], cmaps[panel], norms[panel]
                         )
                         ax.set_title(name, loc="left")
                     else:
