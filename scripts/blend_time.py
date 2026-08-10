@@ -119,18 +119,24 @@ def main() -> None:
                 # A few more frames so the animation ends on a mixed tank.
                 stop_at = step + round(3 * spr)
 
-    if theta95_steps is None:
-        raise SystemExit(f"CoV never reached 5% within {args.max_revs:g} revolutions")
-
-    theta95_s = theta95_steps * scales.dt_s
+    # Save FIRST, verdict after. A run that misses its endpoint is exactly the run
+    # whose frames are needed -- they show where the unmixed region sits -- and the
+    # first blend attempt threw them away by exiting before the save.
+    crossed = theta95_steps is not None
+    theta95_s = theta95_steps * scales.dt_s if crossed else float("nan")
     imp = case.primary_impeller
     np_used = args.np_measured or 4.11   # n=96 measured value from the Np ladder
     ref = grenville_blend_time(
         imp.speed_hz, np_used, imp.diameter_m, case.geometry.vessel.diameter_m
     )
-    print(f"\ntheta_95 = {theta95_s:.2f} s  ({theta95_steps / spr:.1f} revolutions)")
-    print(f"Grenville (Np = {np_used:g}): {ref:.2f} s   ->   "
-          f"ratio {theta95_s / ref:.2f}  (target 0.7-1.3)")
+    if crossed:
+        print(f"\ntheta_95 = {theta95_s:.2f} s  ({theta95_steps / spr:.1f} revolutions)")
+        print(f"Grenville (Np = {np_used:g}): {ref:.2f} s   ->   "
+              f"ratio {theta95_s / ref:.2f}  (target 0.7-1.3)")
+    else:
+        final_cov = history[-1][1]
+        print(f"\nCoV never reached 5% within {args.max_revs:g} revolutions "
+              f"(final CoV = {final_cov:.3f}). Saving diagnostics anyway.")
 
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"blend_{case.name}_n{args.n}.npz"
