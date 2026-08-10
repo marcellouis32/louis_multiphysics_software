@@ -153,8 +153,22 @@ class D3Q19Solver:
         self.nu_t = ti.field(self.dtype, shape=shape)
         self.nu_t.fill(0)
 
-        self.solid.from_numpy(solid.astype(np.int32))
+        # Solid semantics: 0 fluid, 1 solid, 2 solid-and-measured. Nodes marked 2 have
+        # the momentum they exchange with the fluid accumulated into force and torque
+        # each step -- the machinery the power number stands on. A plain bool mask
+        # casts to 0/1 and measures nothing, so every pre-Phase-2 caller is unchanged.
+        solid_int = solid.astype(np.int32)
+        self.solid.from_numpy(solid_int)
         self.wall_vel.fill(0)
+
+        self._measure = bool(np.any(solid_int == 2))
+        self._link_force = ti.Vector.field(3, self.dtype, shape=())
+        self._link_torque = ti.Vector.field(3, self.dtype, shape=())
+        # Torque reference axis: a point it passes through (the torque is reported as a
+        # full vector, so the axis *direction* is the caller's projection to take).
+        # Defaults to the domain centreline, which is the tank shaft by construction.
+        self.axis = ti.Vector.field(3, self.dtype, shape=())
+        self.axis[None] = [(shape[0] - 1) / 2.0, (shape[1] - 1) / 2.0, 0.0]
 
         self._build_kernels()
         self.reset()
@@ -173,6 +187,7 @@ class D3Q19Solver:
         cs2 = d3q19.CS2
         smag = self.smagorinsky
         les_on = smag > 0.0
+        measure = self._measure
 
         @ti.func
         def q_norm(fneq):
@@ -289,6 +304,47 @@ class D3Q19Solver:
                         dst[i, j, k] = b
                         self.rho[i, j, k] = 1.0
                         self.vel[i, j, k] = ti.Vector.zero(self.dtype, 3)
+
+                        # --- momentum exchange, on measured solids only.
+                        # Per boundary link, the momentum handed to the wall in one step
+                        # is e_q (f_in + f_out) -- what arrives plus what is thrown back.
+                        # The populations are stored shifted by w_q, and the shift does
+                        # NOT cancel per link: f_in + f_out = (g_in + g_out) + 2 w_q. It
+                        # is restored explicitly here. (Summed over a closed body the
+                        # 2 w_q terms telescope to zero, which makes forgetting them
+                        # invisible on exactly the symmetric test cases one debugs with
+                        # -- the Couette analytic torque exists to catch that.)
+                        # Deliberately nested rather than one `and`: the outer test is
+                        # compile-time (ti.static) and elides the whole block from
+                        # kernels that measure nothing; folding it into a runtime
+                        # conjunction would put the cost on every solid node forever.
+                        if ti.static(measure):  # noqa: SIM102
+                            if self.solid[i, j, k] == 2:
+                                for q in ti.static(range(1, Q)):
+                                    si = (i - EX[q] + nx) % nx
+                                    sj = (j - EY[q] + ny) % ny
+                                    sk = (k - EZ[q] + nz) % nz
+                                    if self.solid[si, sj, sk] == 0:
+                                        eu = (EX[q] * uw[0] + EY[q] * uw[1]
+                                              + EZ[q] * uw[2])
+                                        # f_in = g[q] + w_q arrived along e_q; the
+                                        # bounced partner leaves along -e_q as
+                                        # b[OPP[q]] + w_q = g[q] - 6 w_q eu + w_q.
+                                        dp = 2.0 * g[q] + 2.0 * W[q] - 6.0 * W[q] * eu
+                                        fx = EX[q] * dp
+                                        fy = EY[q] * dp
+                                        fz = EZ[q] * dp
+                                        self._link_force[None] += ti.Vector([fx, fy, fz])
+                                        # Torque arm: the link midpoint, where the wall
+                                        # actually sits under the halfway convention.
+                                        rx = i - 0.5 * EX[q] - self.axis[None][0]
+                                        ry = j - 0.5 * EY[q] - self.axis[None][1]
+                                        rz = k - 0.5 * EZ[q] - self.axis[None][2]
+                                        self._link_torque[None] += ti.Vector([
+                                            ry * fz - rz * fy,
+                                            rz * fx - rx * fz,
+                                            rx * fy - ry * fx,
+                                        ])
                     else:
                         # --- macroscopic. The +1 undoes the w_i shift: sum(f) = sum(g) + 1
                         # because the weights sum to one. Momentum needs no correction,
@@ -487,8 +543,32 @@ class D3Q19Solver:
         self.wall_vel.from_numpy(vel.astype(_np_dtype(self.ti, self.dtype)))
 
     def step(self) -> None:
+        if self._measure:
+            self._link_force[None] = [0.0, 0.0, 0.0]
+            self._link_torque[None] = [0.0, 0.0, 0.0]
         self._steps[self._parity]()
         self._parity ^= 1
+
+    def set_wall_velocity(self, velocity: np.ndarray) -> None:
+        """Per-node wall velocity, shape (nx, ny, nz, 3). The vector generalisation of
+        `set_moving_wall`, needed as soon as a wall rotates: u = omega x r differs at
+        every node."""
+        self.wall_vel.from_numpy(
+            np.ascontiguousarray(velocity, dtype=_np_dtype(self.ti, self.dtype))
+        )
+
+    def set_axis(self, cx: float, cy: float, cz: float = 0.0) -> None:
+        """Point the torque arm is measured from, in node coordinates."""
+        self.axis[None] = [float(cx), float(cy), float(cz)]
+
+    def force(self) -> np.ndarray:
+        """Momentum handed to the measured solid in the last step (lattice units)."""
+        return self._link_force[None].to_numpy()
+
+    def torque(self) -> np.ndarray:
+        """Torque on the measured solid in the last step, about `axis` (lattice
+        units). For the tank, the power number wants the z component."""
+        return self._link_torque[None].to_numpy()
 
     def total_mass(self) -> float:
         """Sum of the real populations over every node, the exactly conserved quantity.
