@@ -30,7 +30,8 @@ from lms.schema.case import load_case
 from lms.schema.reference import REFERENCE_POWER_NUMBER
 
 
-def build_solver(case, scales, tank, prefer_gpu: bool = True) -> D3Q19Solver:
+def build_solver(case, scales, tank, prefer_gpu: bool = True,
+                 cs_override: float | None = None) -> D3Q19Solver:
     init_backend(prefer_gpu=prefer_gpu, precision="fp32" if prefer_gpu else "fp64")
 
     solid = tank.static_solid.astype(np.int32)
@@ -41,6 +42,8 @@ def build_solver(case, scales, tank, prefer_gpu: bool = True) -> D3Q19Solver:
 
     turb = case.physics.momentum.turbulence
     smagorinsky = turb.smagorinsky_constant if turb.model != "none" else 0.0
+    if cs_override is not None:
+        smagorinsky = cs_override
 
     solver = D3Q19Solver(
         tank.shape,
@@ -62,6 +65,9 @@ def main() -> None:
     p.add_argument("--spinup", type=float, default=10.0, help="revolutions discarded")
     p.add_argument("--average", type=float, default=30.0, help="revolutions averaged")
     p.add_argument("--frames-per-rev", type=int, default=10)
+    p.add_argument("--plate-cells", type=float, default=None,
+                   help="force blade/disc plate thickness in cells (sensitivity runs)")
+    p.add_argument("--cs", type=float, default=None, help="override Smagorinsky Cs")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--out", type=Path, default=Path("runs/tank"))
     args = p.parse_args()
@@ -73,7 +79,13 @@ def main() -> None:
 
     scales = scales_from_case(case)
     tank = tank_from_case(case, scales)
-    solver = build_solver(case, scales, tank, prefer_gpu=not args.cpu)
+    if args.plate_cells is not None:
+        # Sensitivity experiments: the voxel impeller's effective plate thickness is
+        # resolution-quantised, so dNp/dt has to be measured by varying t at fixed n,
+        # not inferred across a ladder where t/D changes with every rung.
+        tank.impeller["thickness"] = args.plate_cells
+    solver = build_solver(case, scales, tank, prefer_gpu=not args.cpu,
+                          cs_override=args.cs)
 
     spr = scales.steps_per_revolution
     n_spin = round(args.spinup * spr)
@@ -140,10 +152,19 @@ def main() -> None:
         verdict = ("inside the published band" if inside
                    else "within 10% of the band" if within10 else "OUTSIDE the band")
         print(f"published {imp_type.value}: {lo}-{hi}  ->  {verdict}")
+    nu_t = solver.nu_t.to_numpy()
+    fluid = tank.static_solid == 0
+    print(f"eddy viscosity: mean nu_t/nu = {nu_t[fluid].mean() / scales.nu:,.0f}   "
+          f"effective Re at mean nu_t ~ "
+          f"{scales.reynolds / (1 + nu_t[fluid].mean() / scales.nu):,.0f}")
     print(f"{elapsed:,.0f}s at {mlups:,.0f} MLUPS")
 
     args.out.mkdir(parents=True, exist_ok=True)
     tag = f"{case.name}_n{case.numerics.cells_across_tank}"
+    if args.plate_cells is not None:
+        tag += f"_t{args.plate_cells:g}"
+    if args.cs is not None:
+        tag += f"_cs{args.cs:g}"
     path = args.out / f"tank_{tag}.npz"
     vel = solver.vel.to_numpy()
     np.savez_compressed(
