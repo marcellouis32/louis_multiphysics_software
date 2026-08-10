@@ -88,9 +88,14 @@ def main() -> None:
     mid_y = tank.shape[1] // 2
     history, frames_c, frames_u, frame_revs = [], [], [], []
     theta95_steps = None
+    stop_at = None
 
     total = round(args.max_revs * spr)
     for step in range(total):
+        # Reassigning `total` would not shorten range(total) -- it was materialised at
+        # loop entry -- so the early exit is an explicit break.
+        if stop_at is not None and step >= stop_at:
+            break
         solver.step()
         tracer.step()
         if step % check_every == 0:
@@ -112,7 +117,7 @@ def main() -> None:
                 theta95_steps = step
                 print(f"  -> CoV crossed 5% at rev {revs:.2f}")
                 # A few more frames so the animation ends on a mixed tank.
-                total = min(total, step + round(3 * spr))
+                stop_at = step + round(3 * spr)
 
     if theta95_steps is None:
         raise SystemExit(f"CoV never reached 5% within {args.max_revs:g} revolutions")
