@@ -443,9 +443,23 @@ class D3Q19Solver:
                                         # bounced partner leaves along -e_q as
                                         # b[OPP[q]] + w_q = g[q] - 6 w_q eu + w_q.
                                         dp = 2.0 * g[q] + 2.0 * W[q] - 6.0 * W[q] * eu
-                                        fx = EX[q] * dp
-                                        fy = EY[q] * dp
-                                        fz = EZ[q] * dp
+                                        # Galilean correction for a MOVING wall (Wen
+                                        # et al. 2014): the naive e (f_in + f_out)
+                                        # exchange is derived in the wall's rest
+                                        # frame; in the lab frame the transferred
+                                        # momentum is (e - u_w) f_in - (-e - u_w)
+                                        # f_out, adding -u_w (f_in - f_out). Our
+                                        # bounce-back gives f_in - f_out = 6 w eu
+                                        # exactly. Drag and this term are both
+                                        # quadratic in wall speed, so omitting it is
+                                        # an O(1) relative error on moving-blade
+                                        # torque -- while cancelling by symmetry on
+                                        # bodies of revolution, which is why Couette
+                                        # (and every static case) never saw it.
+                                        cw = 6.0 * W[q] * eu
+                                        fx = EX[q] * dp - uw[0] * cw
+                                        fy = EY[q] * dp - uw[1] * cw
+                                        fz = EZ[q] * dp - uw[2] * cw
                                         self._link_force[None] += ti.Vector([fx, fy, fz])
                                         # Torque arm: the link midpoint, where the wall
                                         # actually sits under the halfway convention.
