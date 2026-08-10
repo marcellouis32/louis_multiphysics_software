@@ -606,3 +606,107 @@ class TestRegularization:
         collision cannot pin the bounce-back wall the way TRT does."""
         reg = d3q19.regularize(self._arbitrary_fneq())
         assert np.abs(reg - reg[d3q19.OPPOSITE]).max() < 1e-14
+
+
+class TestRotor:
+    """The rotating impeller. The blade set is evaluated analytically in the kernel;
+    these tests pin it to the NumPy oracle and to the physics a rotating body must
+    exhibit, so a wrong power number later cannot hide a geometry bug."""
+
+    @staticmethod
+    def _tank(n=48):
+        from lms.geometry.tank import tank_from_case
+        from lms.lbm.units import scales_from_case
+        from lms.schema.case import load_case
+
+        case = load_case("cases/examples/rushton_standard.yaml").model_copy(deep=True)
+        case.numerics.cells_across_tank = n
+        scales = scales_from_case(case)
+        return case, scales, tank_from_case(case, scales)
+
+    @staticmethod
+    def _solver(scales, tank, prefer_gpu=False, precision="fp64"):
+        from lms.lbm.d2q9 import viscosity_to_omega
+        from lms.lbm.solver3d import D3Q19Solver, init_backend
+
+        init_backend(prefer_gpu=prefer_gpu, precision=precision)
+        solid = tank.static_solid.astype(np.int32)
+        imp_static = tank.impeller_static_mask()
+        solid[imp_static] = 2
+        s = D3Q19Solver(
+            tank.shape, omega=viscosity_to_omega(max(scales.nu, 1e-4)), solid=solid,
+            collision="regularized", smagorinsky=0.1, rotor=tank.rotor_params(),
+        )
+        s.set_wall_velocity(tank.impeller_wall_velocity(imp_static))
+        return s
+
+    def test_kernel_blades_match_the_numpy_oracle_exactly(self):
+        """Mask-for-mask, fp64, at the initial angle and after 300 device advances.
+        The kernel folds the node angle into the nearest blade sector; the oracle
+        rotates and tests each blade -- different algebra, identical geometry, so
+        exact equality is the correct demand (in fp64; fp32 may flip tie cells)."""
+        _, scales, tank = self._tank()
+        s = self._solver(scales, tank)
+
+        assert (s.solid_snapshot() == (
+            tank.static_solid | tank.impeller_mask(0.0)
+        )).all()
+
+        for _ in range(300):
+            s._begin_step()
+            s.theta += tank.rotor_params()["omega"]
+        oracle = tank.static_solid | tank.impeller_mask(s.theta)
+        assert (s.solid_snapshot() == oracle).all()
+
+    def test_fluid_torque_resists_the_rotation(self):
+        """The blades do positive work on the fluid, so the fluid's torque on the
+        impeller must oppose omega -- same sign convention Couette pinned."""
+        _, scales, tank = self._tank(n=40)
+        s = self._solver(scales, tank, prefer_gpu=True, precision="fp32")
+        for _ in range(600):
+            s.step()
+        history = s.drain_torque_log()
+        # Skip the impulsive start; judge the settled tail.
+        assert history[-200:].mean() < 0.0
+
+    def test_mass_drift_from_swept_cells_is_bounded(self):
+        """Covered cells swallow their fluid mass; uncovered ones are refilled at
+        rho = 1. Neither is exactly conservative, so the honest statement is a bound:
+        the drift over a quarter revolution stays below 0.1% of total mass."""
+        _, scales, tank = self._tank(n=40)
+        s = self._solver(scales, tank, prefer_gpu=True, precision="fp32")
+        before = s.total_mass()
+        quarter_rev = round(scales.steps_per_revolution / 4)
+        for _ in range(quarter_rev):
+            s.step()
+        drift = abs(s.total_mass() - before) / before
+        assert drift < 1e-3
+
+    def test_device_log_equals_per_step_reads(self):
+        """The 6x-faster path must be the same numbers: the ring log after N steps
+        holds a leading zero (pre-first-step) then steps 1..N-1, with step N still in
+        the accumulator."""
+        _, scales, tank = self._tank(n=32)
+        s = self._solver(scales, tank, prefer_gpu=False, precision="fp64")
+        per_step = []
+        for _ in range(24):
+            s.step()
+            per_step.append(s.torque()[2])
+        log = s.drain_torque_log()
+        assert log[0] == 0.0
+        assert np.allclose(log[1:], per_step[:-1], rtol=1e-12, atol=1e-14)
+        assert s.torque()[2] == pytest.approx(per_step[-1])
+
+    def test_flow_stays_finite_through_many_sweeps(self):
+        """Fresh-node refill is the new correctness risk; blades sweeping through
+        cells for half a revolution with LES on must not seed anything unbounded."""
+        _, scales, tank = self._tank(n=40)
+        s = self._solver(scales, tank, prefer_gpu=True, precision="fp32")
+        half_rev = round(scales.steps_per_revolution / 2)
+        for _ in range(half_rev):
+            s.step()
+        _, ux, uy, uz = s.macroscopic()
+        speed = np.sqrt(ux**2 + uy**2 + uz**2)
+        assert np.isfinite(speed).all()
+        # Nothing in the tank should exceed a modest multiple of the tip speed.
+        assert speed.max() < 3.0 * scales.u_tip

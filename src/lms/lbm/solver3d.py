@@ -115,7 +115,14 @@ class D3Q19Solver:
         collision: Literal["bgk", "trt", "regularized"] = "trt",
         dtype=None,
         smagorinsky: float = 0.0,
+        rotor: dict | None = None,
     ) -> None:
+        """`rotor`, when given, adds a rotating blade set evaluated analytically in the
+        kernel (see `Tank.rotor_params`). Keys: z_centre, blade_inner, blade_outer,
+        half_t, half_h, n_blades, omega (radians per step). The axisymmetric parts of
+        an impeller -- disc, hub, shaft -- do NOT belong in it: they rotate without
+        changing shape, so they go in `solid` (marked 2 to be measured) with their
+        wall velocity set once via `set_wall_velocity`."""
         ti = _taichi()
         self.ti = ti
         self.shape = shape
@@ -161,9 +168,31 @@ class D3Q19Solver:
         self.solid.from_numpy(solid_int)
         self.wall_vel.fill(0)
 
-        self._measure = bool(np.any(solid_int == 2))
+        self._rotor = dict(rotor) if rotor is not None else None
+        self.theta = 0.0
+        """Host-side mirror of the shaft angle, for bookkeeping (revolution counts,
+        oracle comparisons). The authoritative angle lives on the device and is
+        advanced by a kernel, so stepping involves no host traffic at all."""
+        # 0-d fields rather than kernel arguments: this module uses
+        # `from __future__ import annotations`, which turns argument annotations into
+        # strings Taichi cannot resolve -- the same trap ti.template() hit in Phase 1a.
+        self._theta_now = ti.field(self.dtype, shape=())
+        self._theta_prev = ti.field(self.dtype, shape=())
+        self._theta_now[None] = 0.0
+        self._theta_prev[None] = 0.0
+
+        self._measure = bool(np.any(solid_int == 2)) or self._rotor is not None
         self._link_force = ti.Vector.field(3, self.dtype, shape=())
         self._link_torque = ti.Vector.field(3, self.dtype, shape=())
+        # Torque history lives on the device and is drained rarely. Reading the
+        # accumulator back every step costs a full pipeline sync per step -- measured
+        # at 6x total slowdown on the first tank run -- for a number nobody needs
+        # until the averaging window closes.
+        self._log_ring = 1 << 16
+        self._torque_log = ti.field(self.dtype, shape=self._log_ring)
+        self._log_head = ti.field(ti.i32, shape=())
+        self._log_head[None] = 0
+        self._log_read = 0
         # Torque reference axis: a point it passes through (the torque is reported as a
         # full vector, so the axis *direction* is the caller's projection to take).
         # Defaults to the domain centreline, which is the tank shaft by construction.
@@ -188,6 +217,21 @@ class D3Q19Solver:
         smag = self.smagorinsky
         les_on = smag > 0.0
         measure = self._measure
+        has_rotor = self._rotor is not None
+        rot = self._rotor or {}
+        rot_zc = float(rot.get("z_centre", 0.0))
+        rot_in = float(rot.get("blade_inner", 0.0))
+        rot_out = float(rot.get("blade_outer", 0.0))
+        rot_half_t = float(rot.get("half_t", 0.0))
+        rot_half_h = float(rot.get("half_h", 0.0))
+        rot_omega = float(rot.get("omega", 0.0))
+        rot_sector = 2.0 * np.pi / int(rot.get("n_blades", 1))
+        # Loose radial guards; correctness comes from the exact test inside them.
+        rot_r2_lo = max(rot_in - 1.5, 0.0) ** 2
+        rot_r2_hi = (rot_out + 1.5) ** 2
+        axis_x = (nx - 1) / 2.0
+        axis_y = (ny - 1) / 2.0
+        ring = self._log_ring
 
         @ti.func
         def q_norm(fneq):
@@ -259,6 +303,53 @@ class D3Q19Solver:
                 out[q] = W[q] * (rho * (1.0 + 3.0 * eu + 4.5 * eu * eu - 1.5 * usq) - 1.0)
             return out
 
+        @ti.func
+        def blade_at(x, y, z, th):
+            """Is the point (relative to the shaft axis) inside a blade at angle th?
+
+            Angular folding instead of a loop over blades: the node's polar angle is
+            wrapped into the nearest blade's sector, so one sin/cos pair decides
+            membership regardless of blade count. Blades cannot overlap angularly at
+            r >= blade_inner, so the nearest blade is the only candidate. The algebra
+            is identical to `Tank.blade_mask` -- xb = r cos(phi - a), yb = r sin(phi
+            - a) -- including the tie epsilon carried inside half_t, which is what
+            makes the mask-for-mask oracle comparison exact in fp64.
+            """
+            inside = 0
+            if ti.abs(z - rot_zc) <= rot_half_h:
+                r2 = x * x + y * y
+                if rot_r2_lo <= r2 <= rot_r2_hi:
+                    phi = ti.atan2(y, x)
+                    d = phi - th
+                    d = d - rot_sector * ti.round(d / rot_sector)
+                    r = ti.sqrt(r2)
+                    xb = r * ti.cos(d)
+                    yb = r * ti.sin(d)
+                    if ti.abs(yb) <= rot_half_t and rot_in <= xb <= rot_out:
+                        inside = 1
+            return inside
+
+        @ti.kernel
+        def begin_step():
+            # Everything the host used to do between steps, moved onto the device so
+            # stepping involves no host traffic at all: log the previous step's
+            # torque into the ring, zero the accumulators, advance the shaft angle.
+            head = self._log_head[None]
+            self._torque_log[head % ring] = self._link_torque[None][2]
+            self._log_head[None] = head + 1
+            self._link_force[None] = ti.Vector.zero(self.dtype, 3)
+            self._link_torque[None] = ti.Vector.zero(self.dtype, 3)
+            if ti.static(has_rotor):
+                # Wrapped by 2 pi to keep fp32 honest over long runs: at ~1e-3
+                # rad/step an unwrapped angle passes 1e4 within minutes and fp32
+                # starts eating the increment.
+                self._theta_prev[None] = self._theta_now[None]
+                nxt = self._theta_now[None] + rot_omega
+                if nxt > 6.283185307179586:
+                    nxt -= 6.283185307179586
+                    self._theta_prev[None] -= 6.283185307179586
+                self._theta_now[None] = nxt
+
         @ti.kernel
         def initialise():
             for i, j, k in self.f:
@@ -291,12 +382,26 @@ class D3Q19Solver:
                         sk = (k - EZ[q] + nz) % nz
                         g[q] = src[si, sj, sk][q]
 
-                    if self.solid[i, j, k] != 0:
+                    # Blade membership is a function, not a field: solid(x, t)
+                    # evaluated analytically per node, so rotation involves no mask
+                    # updates and no host traffic.
+                    xr = i - axis_x
+                    yr = j - axis_y
+                    dyn = 0
+                    if ti.static(has_rotor):
+                        dyn = blade_at(xr, yr, k, self._theta_now[None])
+
+                    if self.solid[i, j, k] != 0 or dyn != 0:
                         # Halfway bounce-back. The population that arrived from a fluid
                         # neighbour is sent straight back the way it came, so the wall sits
                         # midway between this node and that neighbour. A moving wall adds
                         # 6*w_i*(e_i . u_wall), which is the momentum the wall imparts.
                         uw = self.wall_vel[i, j, k]
+                        if ti.static(has_rotor):  # noqa: SIM102 -- static/runtime split
+                            if dyn != 0:
+                                # Rigid rotation: u = omega x r, fresh every step, so a
+                                # blade's wall velocity is exact at every node it covers.
+                                uw = ti.Vector([-rot_omega * yr, rot_omega * xr, 0.0])
                         b = ti.Vector.zero(self.dtype, Q)
                         for q in ti.static(range(Q)):
                             eu = EX[q] * uw[0] + EY[q] * uw[1] + EZ[q] * uw[2]
@@ -319,12 +424,19 @@ class D3Q19Solver:
                         # kernels that measure nothing; folding it into a runtime
                         # conjunction would put the cost on every solid node forever.
                         if ti.static(measure):  # noqa: SIM102
-                            if self.solid[i, j, k] == 2:
+                            if self.solid[i, j, k] == 2 or dyn != 0:
                                 for q in ti.static(range(1, Q)):
                                     si = (i - EX[q] + nx) % nx
                                     sj = (j - EY[q] + ny) % ny
                                     sk = (k - EZ[q] + nz) % nz
-                                    if self.solid[si, sj, sk] == 0:
+                                    nbr_fluid = self.solid[si, sj, sk] == 0
+                                    if ti.static(has_rotor):  # noqa: SIM102 -- static/runtime split
+                                        if nbr_fluid and blade_at(
+                                            xr - EX[q], yr - EY[q], k - EZ[q],
+                                            self._theta_now[None],
+                                        ) != 0:
+                                            nbr_fluid = False
+                                    if nbr_fluid:
                                         eu = (EX[q] * uw[0] + EY[q] * uw[1]
                                               + EZ[q] * uw[2])
                                         # f_in = g[q] + w_q arrived along e_q; the
@@ -346,6 +458,18 @@ class D3Q19Solver:
                                             rx * fy - ry * fx,
                                         ])
                     else:
+                        if ti.static(has_rotor):  # noqa: SIM102 -- static/runtime split
+                            # A node the blade just vacated holds bounce-back state,
+                            # not a fluid distribution. Refill at equilibrium with the
+                            # departing wall's velocity; the non-equilibrium part
+                            # re-establishes within a few steps (omega ~ 1.99). Any
+                            # artifact this leaves shows up as spikes in the torque
+                            # history, which the power-number run records anyway --
+                            # the diagnostic is free.
+                            if blade_at(xr, yr, k, self._theta_prev[None]) != 0:
+                                uwf = ti.Vector([-rot_omega * yr, rot_omega * xr, 0.0])
+                                g = feq_shifted(1.0, uwf)
+
                         # --- macroscopic. The +1 undoes the w_i shift: sum(f) = sum(g) + 1
                         # because the weights sum to one. Momentum needs no correction,
                         # since sum_i w_i e_i vanishes by construction.
@@ -476,6 +600,24 @@ class D3Q19Solver:
             for i, j, k in speed:
                 speed[i, j, k] = self.vel[i, j, k].norm()
 
+        snap = ti.field(ti.i32, shape=self.shape) if has_rotor else None
+        if has_rotor:
+
+            @ti.kernel
+            def snapshot_solid():
+                for i, j, k in snap:
+                    d = blade_at(i - axis_x, j - axis_y, k, self._theta_now[None])
+                    v = 0
+                    if self.solid[i, j, k] != 0 or d != 0:
+                        v = 1
+                    snap[i, j, k] = v
+
+            self._snapshot_solid = snapshot_solid
+        else:
+            self._snapshot_solid = None
+        self._solid_snap = snap
+        self._begin_step = begin_step if measure else None
+
         self._initialise = initialise
         self._steps = (make_step(self.f, self.f_new), make_step(self.f_new, self.f))
         self._parity = 0
@@ -489,6 +631,11 @@ class D3Q19Solver:
     def reset(self) -> None:
         self._initialise()
         self._parity = 0
+        self.theta = 0.0
+        self._theta_now[None] = 0.0
+        self._theta_prev[None] = 0.0
+        self._log_head[None] = 0
+        self._log_read = 0
 
     def set_state(
         self,
@@ -543,11 +690,42 @@ class D3Q19Solver:
         self.wall_vel.from_numpy(vel.astype(_np_dtype(self.ti, self.dtype)))
 
     def step(self) -> None:
-        if self._measure:
-            self._link_force[None] = [0.0, 0.0, 0.0]
-            self._link_torque[None] = [0.0, 0.0, 0.0]
+        if self._begin_step is not None:
+            self._begin_step()
+            if self._rotor is not None:
+                self.theta += self._rotor["omega"]
         self._steps[self._parity]()
         self._parity ^= 1
+
+    def drain_torque_log(self) -> np.ndarray:
+        """Torque-z history accumulated on the device since the last drain.
+
+        Each `step()` logs the *previous* step's torque, so after N steps the log
+        holds N entries: a leading zero from before the first step, then steps
+        1..N-1. The current step's torque is still in the accumulator; read it with
+        `torque()` after the final step if the last entry matters. Drain at least
+        every `_log_ring` steps or the ring wraps over unread history -- the assert
+        is loud about it, because silent overwrite would bias the Np average."""
+        head = int(self._log_head[None])
+        fresh = head - self._log_read
+        if fresh == 0:
+            return np.array([])
+        assert fresh <= self._log_ring, (
+            f"torque ring wrapped: {fresh} unread entries > ring {self._log_ring}; "
+            "drain more often"
+        )
+        log = self._torque_log.to_numpy()
+        idx = np.arange(self._log_read, head) % self._log_ring
+        self._log_read = head
+        return log[idx]
+
+    def solid_snapshot(self) -> np.ndarray:
+        """Combined static + blade solid mask at the current angle, for comparison
+        against the NumPy oracle (`Tank.blade_mask` union `static`)."""
+        if self._snapshot_solid is None:
+            raise RuntimeError("solid_snapshot needs a rotor")
+        self._snapshot_solid()
+        return self._solid_snap.to_numpy().astype(bool)
 
     def set_wall_velocity(self, velocity: np.ndarray) -> None:
         """Per-node wall velocity, shape (nx, ny, nz, 3). The vector generalisation of

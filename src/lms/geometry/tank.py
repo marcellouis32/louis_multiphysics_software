@@ -82,8 +82,26 @@ class Tank:
     impeller: dict = field(default_factory=dict)
     omega_shaft: float = 0.0
 
-    def impeller_mask(self, theta: float = 0.0) -> np.ndarray:
-        """Boolean mask of the impeller (disc, blades, hub, shaft) at shaft angle theta.
+    def impeller_static_mask(self) -> np.ndarray:
+        """Disc, hub and shaft: the axisymmetric parts of the impeller.
+
+        Axisymmetry is worth exploiting, not just noting. These parts rotate without
+        changing shape, so they live in the solver's *static* solid field with a
+        static wall velocity omega x r -- machinery verified since Phase 1a. Only the
+        blades need the dynamic in-kernel treatment, which confines the fresh-node
+        problem to the blade-swept band.
+        """
+        p = self.impeller
+        x, y, z = _node_coords(self.shape)
+        r = np.hypot(x, y)
+        zc = p["z_centre"]
+        solid = (r <= p["disc_radius"]) & (np.abs(z - zc) <= p["thickness"] / 2.0)
+        solid |= (r <= p["hub_radius"]) & (np.abs(z - zc) <= p["blade_height"] / 2.0)
+        solid |= (r <= p["shaft_radius"]) & (z >= zc)
+        return solid
+
+    def blade_mask(self, theta: float = 0.0) -> np.ndarray:
+        """The blades alone, at shaft angle theta.
 
         Implemented by rotating the *query points* by -theta and testing against the
         blade at its reference position -- exactly the transformation the GPU kernel
@@ -91,20 +109,12 @@ class Tank:
         """
         p = self.impeller
         x, y, z = _node_coords(self.shape)
-        r = np.hypot(x, y)
-        zc = p["z_centre"]
 
-        # Disc, hub and shaft are axisymmetric: theta plays no role.
-        solid = (r <= p["disc_radius"]) & (np.abs(z - zc) <= p["thickness"] / 2.0)
-        solid |= (r <= p["hub_radius"]) & (np.abs(z - zc) <= p["blade_height"] / 2.0)
-        solid |= (r <= p["shaft_radius"]) & (z >= zc)
-
-        # Blades: rotate node coordinates back by theta, then every blade is a box in
-        # its own frame at angle 2*pi*b/n_blades.
         n_blades = p["n_blades"]
         half_t = p["thickness"] / 2.0 + _TIE
         half_h = p["blade_height"] / 2.0
-        in_height = np.abs(z - zc) <= half_h
+        in_height = np.abs(z - p["z_centre"]) <= half_h
+        solid = np.zeros(self.shape, dtype=bool)
         for b in range(n_blades):
             angle = theta + 2.0 * np.pi * b / n_blades
             c, s = np.cos(-angle), np.sin(-angle)
@@ -117,6 +127,28 @@ class Tank:
                 & (xb <= p["blade_outer"])
             )
         return solid
+
+    def impeller_mask(self, theta: float = 0.0) -> np.ndarray:
+        """The whole impeller at shaft angle theta: static parts plus blades."""
+        return self.impeller_static_mask() | self.blade_mask(theta)
+
+    def rotor_params(self) -> dict:
+        """Blade geometry in the form the solver kernel consumes.
+
+        `half_t` carries the same tie epsilon as the oracle, so the kernel and
+        `blade_mask` evaluate the *identical* expression -- the mask-for-mask
+        comparison between them is only meaningful because of that.
+        """
+        p = self.impeller
+        return {
+            "z_centre": p["z_centre"],
+            "blade_inner": p["blade_inner"],
+            "blade_outer": p["blade_outer"],
+            "half_t": p["thickness"] / 2.0 + _TIE,
+            "half_h": p["blade_height"] / 2.0,
+            "n_blades": p["n_blades"],
+            "omega": self.omega_shaft,
+        }
 
     def impeller_wall_velocity(self, mask: np.ndarray) -> np.ndarray:
         """Per-node wall velocity u = omega x r for the given impeller mask,
