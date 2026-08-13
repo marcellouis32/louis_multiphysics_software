@@ -779,3 +779,57 @@ class TestBouzidi:
         tank = tank_from_case(case, scales)
         with pytest.raises(ValueError, match="halfway or bouzidi"):
             tank.rotor_params(boundary="ibm")
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason="KNOWN DEFECT, Phase 2 handoff: the Bouzidi torque meter reads ~3-6x the "
+    "angular momentum the fluid actually receives, while the halfway meter balances "
+    "to ~25%. The reconstruction itself is fine (bulk dL/dt matches halfway); the "
+    "bookkeeping is not. Closing it needs an instrumented momentum ledger: baffle and "
+    "vessel torque measured separately, and the fresh-node refill injection metered. "
+    "Np numbers from the bouzidi meter are NOT trustworthy until this passes.",
+)
+def test_bouzidi_meter_balances_angular_momentum():
+    """The meter must agree with an independent measurement: the rate of change of
+    the fluid's resolved angular momentum, in an early window before the jet reaches
+    the (unmetered) baffles."""
+    from lms.geometry.tank import tank_from_case
+    from lms.lbm.d2q9 import viscosity_to_omega
+    from lms.lbm.solver3d import D3Q19Solver, init_backend
+    from lms.lbm.units import scales_from_case
+    from lms.schema.case import load_case
+
+    case = load_case("cases/examples/rushton_standard.yaml").model_copy(deep=True)
+    case.numerics.cells_across_tank = 48
+    scales = scales_from_case(case)
+    tank = tank_from_case(case, scales)
+    init_backend(prefer_gpu=True, precision="fp32")
+    solid = tank.static_solid.astype(np.int32)
+    solid[tank.impeller_static_mask()] = 2
+    s = D3Q19Solver(
+        tank.shape, omega=viscosity_to_omega(scales.nu), solid=solid,
+        collision="regularized", smagorinsky=0.1,
+        rotor=tank.rotor_params(boundary="bouzidi"),
+    )
+    s.set_wall_velocity(tank.impeller_wall_velocity(tank.impeller_static_mask()))
+    s.set_axis((tank.shape[0] - 1) / 2.0, (tank.shape[1] - 1) / 2.0, 0.0)
+
+    nx, ny, _ = tank.shape
+    x = np.arange(nx)[:, None, None] - (nx - 1) / 2
+    y = np.arange(ny)[None, :, None] - (ny - 1) / 2
+
+    def l_z():
+        _, ux, uy, _ = s.macroscopic()
+        rho = s.rho.to_numpy()
+        return float((rho * (x * uy - y * ux)).sum())
+
+    for _ in range(150):
+        s.step()
+    l0 = l_z()
+    s.drain_torque_log()
+    for _ in range(50):
+        s.step()
+    fluid_gain = (l_z() - l0) / 50
+    meter = -s.drain_torque_log()[1:].mean()
+    assert meter == pytest.approx(fluid_gain, rel=0.5)
