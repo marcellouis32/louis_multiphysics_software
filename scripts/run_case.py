@@ -31,7 +31,8 @@ from lms.schema.reference import REFERENCE_POWER_NUMBER
 
 
 def build_solver(case, scales, tank, prefer_gpu: bool = True,
-                 cs_override: float | None = None) -> D3Q19Solver:
+                 cs_override: float | None = None,
+                 boundary: str = "halfway") -> D3Q19Solver:
     init_backend(prefer_gpu=prefer_gpu, precision="fp32" if prefer_gpu else "fp64")
 
     solid = tank.static_solid.astype(np.int32)
@@ -51,7 +52,7 @@ def build_solver(case, scales, tank, prefer_gpu: bool = True,
         solid=solid,
         collision="regularized",
         smagorinsky=smagorinsky,
-        rotor=tank.rotor_params(),
+        rotor=tank.rotor_params(boundary=boundary),
     )
     solver.set_wall_velocity(tank.impeller_wall_velocity(imp_static))
     solver.set_axis((tank.shape[0] - 1) / 2.0, (tank.shape[1] - 1) / 2.0, 0.0)
@@ -68,14 +69,20 @@ def main() -> None:
     p.add_argument("--plate-cells", type=float, default=None,
                    help="force blade/disc plate thickness in cells (sensitivity runs)")
     p.add_argument("--cs", type=float, default=None, help="override Smagorinsky Cs")
+    p.add_argument("--mach", type=float, default=None, help="override lattice_mach")
+    p.add_argument("--boundary", choices=["halfway", "bouzidi"], default="halfway",
+                   help="blade wall treatment")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--out", type=Path, default=Path("runs/tank"))
     args = p.parse_args()
 
     case = load_case(args.case)
-    if args.n is not None:
+    if args.n is not None or args.mach is not None:
         case = case.model_copy(deep=True)
-        case.numerics.cells_across_tank = args.n
+        if args.n is not None:
+            case.numerics.cells_across_tank = args.n
+        if args.mach is not None:
+            case.numerics.lattice_mach = args.mach
 
     scales = scales_from_case(case)
     tank = tank_from_case(case, scales)
@@ -85,7 +92,7 @@ def main() -> None:
         # not inferred across a ladder where t/D changes with every rung.
         tank.impeller["thickness"] = args.plate_cells
     solver = build_solver(case, scales, tank, prefer_gpu=not args.cpu,
-                          cs_override=args.cs)
+                          cs_override=args.cs, boundary=args.boundary)
 
     spr = scales.steps_per_revolution
     n_spin = round(args.spinup * spr)
@@ -165,6 +172,10 @@ def main() -> None:
         tag += f"_t{args.plate_cells:g}"
     if args.cs is not None:
         tag += f"_cs{args.cs:g}"
+    if args.mach is not None:
+        tag += f"_ma{args.mach:g}"
+    if args.boundary != "halfway":
+        tag += f"_{args.boundary}"
     path = args.out / f"tank_{tag}.npz"
     vel = solver.vel.to_numpy()
     np.savez_compressed(

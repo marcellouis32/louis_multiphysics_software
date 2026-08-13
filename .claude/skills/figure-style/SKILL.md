@@ -32,6 +32,14 @@ the colormap was dead, and the quiet majority of the box — most of the picture
 the neutral midpoint. `style.py` already said diverging fields get a symmetric scale; the
 mistake was applying that to a field that does not diverge.
 
+**On the dark canvas, a sequential ramp's foot must sit visibly ABOVE the
+background.** `FLOW` starts at `#05070c` -- essentially the canvas colour -- which is
+right for LIC shading (darkness there deliberately means slow) and wrong for filled
+fields, where the low end dissolves into the background and mid-range blues turn muddy
+against the blue-grey panel. User feedback on the Phase 2 tank animations. Filled
+speed/energy fields use `EMBER` (inferno lifted off its black foot); dye uses `DYE`
+(magma, same lift). `FLOW` stays for LIC and the legacy 2D cavity figures.
+
 **Diverging maps take a dark neutral, never white.** On a dark canvas a white-centred map
 turns every near-zero region into a glaring blob that dominates the figure. `DIVERGING_DARK`
 anchors zero to the background so the eye goes where the field is actually strong.
@@ -75,6 +83,18 @@ happened.
 **State fitting windows on the figure itself.** A `k^-5/3` guide drawn across the whole
 axis asserts a scaling range that does not exist. Draw the guide only over the window it
 was fitted on, and put the window in the label.
+
+## Renderer follows field character
+
+`contourf` is for smooth fields, where discrete levels carry quantitative meaning
+(cavity, Reynolds sweeps). On a dense turbulent slice, 44 filled levels at GIF dpi
+posterise into soft mush -- the Phase 2 animations were visibly blurry until they
+switched to the image renderer (`renderer="image"` in `contour_animation` /
+`side_by_side_animation`): one pixel per cell, bilinear, masked solids painted as
+`PANEL` so geometry reads as geometry.
+
+The image renderer costs GIF size (continuous tones eat the palette): budget with
+frame count and dpi (`--max-frames`, `--dpi`), not by reverting to contours.
 
 ## Isolines are conditional
 

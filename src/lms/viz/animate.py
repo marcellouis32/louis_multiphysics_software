@@ -80,12 +80,19 @@ def contour_animation(
     track: Sequence[tuple[float, float]] | None = None,
     converged: Sequence[bool] | None = None,
     cap_note: str = "step cap reached (not converged)",
+    renderer: str = "contour",
     fps: int = 6,
     dpi: int = 92,
     figsize: tuple[float, float] = (6.6, 6.0),
     save: str | Path = "animation.gif",
 ) -> Path:
     """Write a GIF of filled contours, one frame per entry in `fields`.
+
+    `renderer="image"` draws each frame with imshow instead of contourf. For dense
+    turbulent fields this is the difference between crisp and blurry: 44 contour
+    levels on a 250^2 slice at GIF dpi posterise into soft mush, while an image is
+    one pixel per cell. Contours remain right for smooth fields (cavity, sweeps),
+    where discrete levels carry quantitative meaning. User feedback, not taste.
 
     `norm` is required and is never recomputed: passing it in is what makes the colour
     scale comparable across frames, and it is left unmutated so a caller can reuse it
@@ -124,7 +131,13 @@ def contour_animation(
             for i, (field, re) in enumerate(zip(fields, reynolds)):
                 ax.clear()
                 data = np.ma.masked_where(mask, field) if mask is not None else np.ma.asarray(field)
-                _draw_contour_layers(ax, xs, ys, data, filled, lines, cmap, norm)
+                if renderer == "image":
+                    ax.imshow(
+                        data, origin="lower", cmap=_bad_aware(cmap), norm=norm,
+                        extent=extent, interpolation="bilinear", aspect="equal",
+                    )
+                else:
+                    _draw_contour_layers(ax, xs, ys, data, filled, lines, cmap, norm)
 
                 if track is not None:
                     track_overlay(track, ax, i)
@@ -151,6 +164,16 @@ def contour_animation(
 
         plt.close(fig)
     return save
+
+
+def _bad_aware(cmap):
+    """Copy of a colormap that paints masked (solid) cells as the panel colour, so
+    walls read as geometry rather than as the lowest data value."""
+    from lms.viz.style import PANEL
+
+    out = plt.get_cmap(cmap).copy() if isinstance(cmap, str) else cmap.copy()
+    out.set_bad(PANEL)
+    return out
 
 
 def _draw_markers(ax, marks: dict) -> None:
@@ -224,6 +247,7 @@ def side_by_side_animation(
     cmap=FLOW,
     n_filled: int = 44,
     n_lines: int = 0,
+    renderer: str = "contour",
     extent: tuple[float, float, float, float] = (0.0, 1.0, 0.0, 1.0),
     fps: int = 8,
     dpi: int = 92,
@@ -290,10 +314,18 @@ def side_by_side_animation(
                         ny, nx = data.shape
                         xs = np.linspace(extent[0], extent[1], nx)
                         ys = np.linspace(extent[2], extent[3], ny)
-                        _draw_contour_layers(
-                            ax, xs, ys, np.ma.asarray(data), filled[panel],
-                            lines[panel], cmaps[panel], norms[panel]
-                        )
+                        if renderer == "image":
+                            ax.imshow(
+                                np.ma.asarray(data), origin="lower",
+                                cmap=_bad_aware(cmaps[panel]), norm=norms[panel],
+                                extent=extent, interpolation="bilinear",
+                                aspect="equal",
+                            )
+                        else:
+                            _draw_contour_layers(
+                                ax, xs, ys, np.ma.asarray(data), filled[panel],
+                                lines[panel], cmaps[panel], norms[panel]
+                            )
                         ax.set_title(name, loc="left")
                     else:
                         ax.set_title(f"{name} — {dead_note}", loc="left", color=ACCENT_WARM)

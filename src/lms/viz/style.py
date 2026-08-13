@@ -41,10 +41,33 @@ DIVERGING_DARK = LinearSegmentedColormap.from_list(
 )
 
 # Perceptually smooth dark-to-bright ramp for speed fields on dark panels.
+# NOTE: its foot (#05070c) sits essentially AT the canvas colour, which is right for
+# LIC shading -- darkness there means slow, deliberately -- but wrong for filled
+# fields, where the low end dissolves into the background and the mid-range blues
+# read muddy. For filled turbulent fields use EMBER below. This was user feedback on
+# the Phase 2 tank animations, not a guess.
 FLOW = LinearSegmentedColormap.from_list(
     "flow",
     ["#05070c", "#122036", "#17456b", "#1f7a92", "#4fb99a", "#b3e07c", "#fdf3b0"],
 )
+
+
+def _truncated(name: str, lo: float, hi: float = 1.0, out: str = "truncated"):
+    import numpy as _np
+
+    base = plt.get_cmap(name)
+    return LinearSegmentedColormap.from_list(out, base(_np.linspace(lo, hi, 256)))
+
+
+# High-contrast sequential for filled fields on the dark canvas: inferno with its
+# near-black foot cut off, so the lowest data value sits visibly ABOVE the background
+# instead of dissolving into it, and the ramp runs purple -> orange -> yellow with far
+# more mid-range separation than a blue ramp can manage against a blue-grey panel.
+EMBER = _truncated("inferno", 0.08, 1.0, "ember")
+
+# Dye rides magma, similarly lifted off its black foot, so tracer and velocity stay
+# visually distinct in every figure while both remain sequential non-negative maps.
+DYE = _truncated("magma", 0.06, 1.0, "dye")
 
 DARK_RC = {
     "figure.facecolor": BACKGROUND,
@@ -185,6 +208,8 @@ __all__ = [
     "ACCENT_WARM",
     "DIVERGING",
     "DIVERGING_DARK",
+    "DYE",
+    "EMBER",
     "FLOW",
     "INK",
     "MUTED",

@@ -226,3 +226,87 @@ class TestCouette:
             s.step()
         assert np.abs(s.force()).max() < 1e-12
         assert np.abs(s.torque()).max() < 1e-11
+
+
+class TestBladeLinkFraction:
+    """The q oracle behind Bouzidi interpolation. A wrong q does not crash -- it
+    quietly moves the wall, which is precisely the defect Bouzidi exists to fix."""
+
+    @staticmethod
+    def _tank(n=96):
+        from lms.geometry.tank import tank_from_case
+        from lms.lbm.units import scales_from_case
+        from lms.schema.case import load_case
+
+        case = load_case("cases/examples/rushton_standard.yaml").model_copy(deep=True)
+        case.numerics.cells_across_tank = n
+        scales = scales_from_case(case)
+        return tank_from_case(case, scales)
+
+    @staticmethod
+    def _inside_true_box(tank, pt, theta):
+        p = tank.impeller
+        sector = 2 * np.pi / p["n_blades"]
+        phi = np.arctan2(pt[1], pt[0])
+        ang = theta + sector * np.round((phi - theta) / sector)
+        c, s = np.cos(ang), np.sin(ang)
+        xb, yb = pt[0] * c + pt[1] * s, -pt[0] * s + pt[1] * c
+        return (
+            p["blade_inner"] <= xb <= p["blade_outer"]
+            and abs(yb) <= p["thickness"] / 2
+            and abs(pt[2] - p["z_centre"]) <= p["blade_height"] / 2
+        )
+
+    def test_matches_bisection_on_random_links(self):
+        """Closed-form slab test against brute-force bisection of the membership
+        function itself: two independent routes to the same geometric fact."""
+        from lms.lbm.d3q19 import EX, EY, EZ
+
+        tank = self._tank()
+        p = tank.impeller
+        rng = np.random.default_rng(11)
+        checked = 0
+        while checked < 150:
+            theta = rng.uniform(0, 2 * np.pi)
+            r = rng.uniform(p["blade_inner"] - 2, p["blade_outer"] + 2)
+            a = rng.uniform(0, 2 * np.pi)
+            z = p["z_centre"] + rng.uniform(-p["blade_height"] / 2 - 2,
+                                            p["blade_height"] / 2 + 2)
+            pt = np.array([r * np.cos(a), r * np.sin(a), z])
+            if self._inside_true_box(tank, pt, theta):
+                continue
+            qdir = rng.integers(1, 19)
+            e = np.array([EX[qdir], EY[qdir], EZ[qdir]], float)
+            if not self._inside_true_box(tank, pt + e, theta):
+                continue
+
+            q_formula = tank.blade_link_fraction(pt, e, theta)
+            lo, hi = 0.0, 1.0
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if self._inside_true_box(tank, pt + mid * e, theta):
+                    hi = mid
+                else:
+                    lo = mid
+            assert np.isfinite(q_formula)
+            assert abs(q_formula - hi) < 1e-6
+            checked += 1
+
+    def test_q_is_half_when_wall_is_halfway(self):
+        """Continuity anchor: a wall exactly midway must give q = 1/2, where both
+        Bouzidi branches reduce to standard halfway bounce-back."""
+        tank = self._tank()
+        p = tank.impeller
+        # Approach the blade face along -y in the blade frame at theta = 0: the face
+        # sits at y = t/2, so starting at y = t/2 + 0.5 puts the wall halfway.
+        x_mid = 0.5 * (p["blade_inner"] + p["blade_outer"])
+        start = np.array([x_mid, p["thickness"] / 2 + 0.5, p["z_centre"]])
+        q = tank.blade_link_fraction(start, np.array([0.0, -1.0, 0.0]), 0.0)
+        assert q == pytest.approx(0.5, abs=1e-9)
+
+    def test_misses_return_nan(self):
+        tank = self._tank()
+        p = tank.impeller
+        start = np.array([p["blade_outer"] + 3.0, 0.0, p["z_centre"]])
+        q = tank.blade_link_fraction(start, np.array([1.0, 0.0, 0.0]), 0.0)
+        assert np.isnan(q)

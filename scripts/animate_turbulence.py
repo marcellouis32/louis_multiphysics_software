@@ -32,7 +32,7 @@ import numpy as np
 from matplotlib.colors import AsinhNorm, PowerNorm
 
 from lms.viz.animate import contour_animation, pooled_norm
-from lms.viz.style import DIVERGING_DARK, FLOW
+from lms.viz.style import DIVERGING_DARK, EMBER
 
 
 def main() -> None:
@@ -86,7 +86,7 @@ def main() -> None:
         label=r"$|\omega|$",
         title="Decaying turbulence — vorticity magnitude",
         subtitle=subtitle,
-        norm=ens_norm, cmap=FLOW, n_filled=44, n_lines=0,
+        norm=ens_norm, cmap=EMBER, renderer="image", n_filled=44, n_lines=0,
         fps=args.fps, dpi=args.dpi,
         save=out / f"anim_enstrophy_{tag}.gif",
     )
@@ -101,7 +101,7 @@ def main() -> None:
         title="Decaying turbulence — spanwise vorticity",
         subtitle=subtitle,
         norm=AsinhNorm(linear_width=max(width, lim * 1e-3), vmin=-lim, vmax=lim),
-        cmap=DIVERGING_DARK, n_filled=44, n_lines=0,
+        cmap=DIVERGING_DARK, renderer="image", n_filled=44, n_lines=0,
         fps=args.fps, dpi=args.dpi,
         save=out / f"anim_wz_{tag}.gif",
     )

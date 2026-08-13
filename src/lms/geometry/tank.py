@@ -132,23 +132,77 @@ class Tank:
         """The whole impeller at shaft angle theta: static parts plus blades."""
         return self.impeller_static_mask() | self.blade_mask(theta)
 
-    def rotor_params(self) -> dict:
+    def rotor_params(self, boundary: str = "halfway") -> dict:
         """Blade geometry in the form the solver kernel consumes.
 
         `half_t` carries the same tie epsilon as the oracle, so the kernel and
         `blade_mask` evaluate the *identical* expression -- the mask-for-mask
         comparison between them is only meaningful because of that.
         """
+        if boundary not in ("halfway", "bouzidi"):
+            raise ValueError(f"boundary must be halfway or bouzidi, got {boundary!r}")
         p = self.impeller
         return {
             "z_centre": p["z_centre"],
             "blade_inner": p["blade_inner"],
             "blade_outer": p["blade_outer"],
             "half_t": p["thickness"] / 2.0 + _TIE,
+            "half_t_true": p["thickness"] / 2.0,
             "half_h": p["blade_height"] / 2.0,
             "n_blades": p["n_blades"],
             "omega": self.omega_shaft,
+            "boundary": boundary,
         }
+
+    def blade_link_fraction(
+        self, point: np.ndarray, direction: np.ndarray, theta: float
+    ) -> float:
+        """Where along a lattice link the blade surface sits: q in (0, 1], or nan.
+
+        `point` is a fluid node (axis-relative x, y and plain z), `direction` a lattice
+        vector whose far end lies inside a blade. Each blade is an axis-aligned box *in
+        its own frame*, so the exact crossing is a slab (ray-box) test after folding
+        the node into the nearest blade's sector -- the same fold `blade_mask` and the
+        kernel use, so all three agree on which blade owns the neighbourhood.
+
+        This is the geometric input Bouzidi interpolation runs on, and the reason no
+        per-link storage exists: q is exact, closed-form, and recomputable per step for
+        a rotating blade. The box uses the *true* half thickness, without the tie
+        epsilon -- ties exist to make node membership deterministic, but the wall is
+        where the wall is.
+        """
+        p = self.impeller
+        x, y, z = float(point[0]), float(point[1]), float(point[2])
+        sector = 2.0 * np.pi / p["n_blades"]
+        phi = np.arctan2(y, x)
+        angle = theta + sector * np.round((phi - theta) / sector)
+        c, s = np.cos(angle), np.sin(angle)
+
+        # Rotate point and direction into the blade frame (blade along +x).
+        px, py = x * c + y * s, -x * s + y * c
+        ex, ey = direction[0] * c + direction[1] * s, -direction[0] * s + direction[1] * c
+        ez = float(direction[2])
+
+        lo = np.array([p["blade_inner"], -p["thickness"] / 2.0,
+                       p["z_centre"] - p["blade_height"] / 2.0])
+        hi = np.array([p["blade_outer"], p["thickness"] / 2.0,
+                       p["z_centre"] + p["blade_height"] / 2.0])
+        origin = np.array([px, py, z])
+        vec = np.array([ex, ey, ez])
+
+        t_lo, t_hi = 0.0, np.inf
+        for a in range(3):
+            if abs(vec[a]) < 1e-12:
+                if origin[a] < lo[a] or origin[a] > hi[a]:
+                    return float("nan")
+                continue
+            t1 = (lo[a] - origin[a]) / vec[a]
+            t2 = (hi[a] - origin[a]) / vec[a]
+            t_lo = max(t_lo, min(t1, t2))
+            t_hi = min(t_hi, max(t1, t2))
+        if t_lo > t_hi or t_lo > 1.0:
+            return float("nan")
+        return float(min(max(t_lo, 1e-6), 1.0))
 
     def impeller_wall_velocity(self, mask: np.ndarray) -> np.ndarray:
         """Per-node wall velocity u = omega x r for the given impeller mask,

@@ -710,3 +710,72 @@ class TestRotor:
         assert np.isfinite(speed).all()
         # Nothing in the tank should exceed a modest multiple of the tip speed.
         assert speed.max() < 3.0 * scales.u_tip
+
+
+class TestBouzidi:
+    """Sub-cell wall placement on the blades. The q geometry is pinned against
+    bisection in test_geometry; here the solver-level guarantees are pinned."""
+
+    @staticmethod
+    def _solver(boundary, n=40):
+        from lms.geometry.tank import tank_from_case
+        from lms.lbm.d2q9 import viscosity_to_omega
+        from lms.lbm.solver3d import D3Q19Solver, init_backend
+        from lms.lbm.units import scales_from_case
+        from lms.schema.case import load_case
+
+        case = load_case("cases/examples/rushton_standard.yaml").model_copy(deep=True)
+        case.numerics.cells_across_tank = n
+        scales = scales_from_case(case)
+        tank = tank_from_case(case, scales)
+        init_backend(prefer_gpu=True, precision="fp32")
+        solid = tank.static_solid.astype(np.int32)
+        solid[tank.impeller_static_mask()] = 2
+        s = D3Q19Solver(
+            tank.shape, omega=viscosity_to_omega(max(scales.nu, 1e-4)), solid=solid,
+            collision="regularized", smagorinsky=0.1,
+            rotor=tank.rotor_params(boundary=boundary),
+        )
+        s.set_wall_velocity(tank.impeller_wall_velocity(tank.impeller_static_mask()))
+        s.set_axis((tank.shape[0] - 1) / 2.0, (tank.shape[1] - 1) / 2.0, 0.0)
+        return s, scales
+
+    def test_stays_finite_and_resists_rotation(self):
+        s, scales = self._solver("bouzidi")
+        for _ in range(800):
+            s.step()
+        hist = s.drain_torque_log()
+        _, ux, uy, uz = s.macroscopic()
+        speed = np.sqrt(ux**2 + uy**2 + uz**2)
+        assert np.isfinite(speed).all()
+        assert speed.max() < 3.0 * scales.u_tip
+        assert hist[-300:].mean() < 0.0
+
+    def test_mass_drift_stays_bounded(self):
+        s, _scales = self._solver("bouzidi")
+        before = s.total_mass()
+        for _ in range(round(_scales.steps_per_revolution / 4)):
+            s.step()
+        assert abs(s.total_mass() - before) / before < 1e-3
+
+    def test_torque_differs_from_halfway_as_it_must(self):
+        """The whole point: sub-cell wall placement changes the measured torque. If
+        the two boundaries agreed exactly, the Bouzidi branch would be dead code."""
+        results = {}
+        for boundary in ("halfway", "bouzidi"):
+            s, _scales = self._solver(boundary)
+            for _ in range(900):
+                s.step()
+            results[boundary] = float(np.abs(s.drain_torque_log()[-400:]).mean())
+        assert results["bouzidi"] != pytest.approx(results["halfway"], rel=1e-3)
+
+    def test_rejects_unknown_boundary(self):
+        from lms.geometry.tank import tank_from_case
+        from lms.lbm.units import scales_from_case
+        from lms.schema.case import load_case
+
+        case = load_case("cases/examples/rushton_standard.yaml")
+        scales = scales_from_case(case)
+        tank = tank_from_case(case, scales)
+        with pytest.raises(ValueError, match="halfway or bouzidi"):
+            tank.rotor_params(boundary="ibm")

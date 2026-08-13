@@ -229,6 +229,20 @@ class D3Q19Solver:
         # Loose radial guards; correctness comes from the exact test inside them.
         rot_r2_lo = max(rot_in - 1.5, 0.0) ** 2
         rot_r2_hi = (rot_out + 1.5) ** 2
+        is_bouzidi = has_rotor and rot.get("boundary") == "bouzidi"
+        # Plain-python constants for the Bouzidi block: int()/float() inside a kernel
+        # body are rewritten into runtime casts by Taichi's AST transformer, so numpy
+        # scalars must be converted OUT here, where ordinary Python still applies.
+        OPP_I = [int(v) for v in OPP]
+        EX_F = [float(v) for v in EX]
+        EY_F = [float(v) for v in EY]
+        EZ_F = [float(v) for v in EZ]
+        rot_ht_true = float(rot.get("half_t_true", rot_half_t))
+        # Band for the Bouzidi link scan: one halo cell beyond the blade box, since
+        # only fluid nodes with a blade-covered neighbour participate.
+        bz_r2_lo = max(rot_in - 1.8, 0.0) ** 2
+        bz_r2_hi = (rot_out + 1.8) ** 2
+        bz_dz = rot_half_h + 1.8
         axis_x = (nx - 1) / 2.0
         axis_y = (ny - 1) / 2.0
         ring = self._log_ring
@@ -329,6 +343,62 @@ class D3Q19Solver:
                         inside = 1
             return inside
 
+        @ti.func
+        def blade_q(x, y, z, ejx, ejy, ejz, th):
+            """Fraction q in (0, 1] of the link from (x, y, z) along e_j at which the
+            blade surface sits, or -1.0 if the ray misses the box.
+
+            Each blade is an axis-aligned box in its own frame, so this is an exact
+            slab test after the same fold `blade_at` uses. The box takes the *true*
+            half thickness: the tie epsilon makes node membership deterministic, but
+            the wall is where the wall is. Mirrors `Tank.blade_link_fraction`, which
+            is the NumPy oracle it is tested against.
+            """
+            phi = ti.atan2(y, x)
+            ang = th + rot_sector * ti.round((phi - th) / rot_sector)
+            ca = ti.cos(ang)
+            sa = ti.sin(ang)
+            px = x * ca + y * sa
+            py = -x * sa + y * ca
+            ex = ejx * ca + ejy * sa
+            ey = -ejx * sa + ejy * ca
+
+            t_lo = 0.0
+            t_hi = 1.0e30
+            ok = 1
+            # x-slab [rot_in, rot_out]
+            if ti.abs(ex) < 1e-12:
+                if px < rot_in or px > rot_out:
+                    ok = 0
+            else:
+                t1 = (rot_in - px) / ex
+                t2 = (rot_out - px) / ex
+                t_lo = ti.max(t_lo, ti.min(t1, t2))
+                t_hi = ti.min(t_hi, ti.max(t1, t2))
+            # y-slab [-ht_true, ht_true]
+            if ti.abs(ey) < 1e-12:
+                if py < -rot_ht_true or py > rot_ht_true:
+                    ok = 0
+            else:
+                t1 = (-rot_ht_true - py) / ey
+                t2 = (rot_ht_true - py) / ey
+                t_lo = ti.max(t_lo, ti.min(t1, t2))
+                t_hi = ti.min(t_hi, ti.max(t1, t2))
+            # z-slab
+            if ti.abs(ejz) < 1e-12:
+                if z < rot_zc - rot_half_h or z > rot_zc + rot_half_h:
+                    ok = 0
+            else:
+                t1 = (rot_zc - rot_half_h - z) / ejz
+                t2 = (rot_zc + rot_half_h - z) / ejz
+                t_lo = ti.max(t_lo, ti.min(t1, t2))
+                t_hi = ti.min(t_hi, ti.max(t1, t2))
+
+            out = -1.0
+            if ok == 1 and t_lo <= t_hi and t_lo <= 1.0:
+                out = ti.min(ti.max(t_lo, 1e-6), 1.0)
+            return out
+
         @ti.kernel
         def begin_step():
             # Everything the host used to do between steps, moved onto the device so
@@ -424,7 +494,9 @@ class D3Q19Solver:
                         # kernels that measure nothing; folding it into a runtime
                         # conjunction would put the cost on every solid node forever.
                         if ti.static(measure):  # noqa: SIM102
-                            if self.solid[i, j, k] == 2 or dyn != 0:
+                            if self.solid[i, j, k] == 2 or (
+                                dyn != 0 and ti.static(not is_bouzidi)
+                            ):
                                 for q in ti.static(range(1, Q)):
                                     si = (i - EX[q] + nx) % nx
                                     sj = (j - EY[q] + ny) % ny
@@ -472,6 +544,7 @@ class D3Q19Solver:
                                             rx * fy - ry * fx,
                                         ])
                     else:
+                        fresh = 0
                         if ti.static(has_rotor):  # noqa: SIM102 -- static/runtime split
                             # A node the blade just vacated holds bounce-back state,
                             # not a fluid distribution. Refill at equilibrium with the
@@ -483,6 +556,99 @@ class D3Q19Solver:
                             if blade_at(xr, yr, k, self._theta_prev[None]) != 0:
                                 uwf = ti.Vector([-rot_omega * yr, rot_omega * xr, 0.0])
                                 g = feq_shifted(1.0, uwf)
+                                fresh = 1
+
+                        if ti.static(is_bouzidi):
+                            # Sub-cell wall placement on blade links (Bouzidi, Firdaouss
+                            # & Lallemand 2001, linear variant). The staircase blade was
+                            # measured to under-drive the flow -- six suspects
+                            # eliminated -- and this is the escalation the plan
+                            # reserved. Fluid-centric: a population arriving from a
+                            # blade-covered upstream node is reconstructed from
+                            # post-collision values at this node and its next fluid
+                            # neighbour, with the wall at its exact fraction q of the
+                            # link. Both branches are affine with coefficients summing
+                            # to one, so the f - w_i storage shift passes through
+                            # exactly as it does for halfway bounce-back.
+                            th_b = self._theta_now[None]
+                            r2_here = xr * xr + yr * yr
+                            in_band = (
+                                fresh == 0
+                                and ti.abs(k - rot_zc) <= bz_dz
+                                and r2_here >= bz_r2_lo
+                                and r2_here <= bz_r2_hi
+                            )
+                            if in_band:
+                                for q in ti.static(range(1, Q)):
+                                    if blade_at(
+                                        xr - EX[q], yr - EY[q], k - EZ[q], th_b
+                                    ) != 0:
+                                        # ti.static keeps jd a Python int: a bare
+                                        # assignment would create a runtime Expr and
+                                        # the list subscripts below would fail.
+                                        jd = ti.static(OPP_I[q])
+                                        qq = blade_q(
+                                            xr, yr, k,
+                                            EX_F[jd], EY_F[jd], EZ_F[jd], th_b,
+                                        )
+                                        # Wall velocity at the actual wall point.
+                                        wxp = xr + qq * EX_F[jd]
+                                        wyp = yr + qq * EY_F[jd]
+                                        uwx = -rot_omega * wyp
+                                        uwy = rot_omega * wxp
+                                        term = 6.0 * W[q] * (EX[q] * uwx + EY[q] * uwy)
+
+                                        fj_here = src[i, j, k][jd]
+                                        gk_new = 0.0
+                                        used1 = 0
+                                        if qq >= 0.0 and qq <= 0.5:
+                                            s2i = (i + EX[q] + nx) % nx
+                                            s2j = (j + EY[q] + ny) % ny
+                                            s2k = (k + EZ[q] + nz) % nz
+                                            far_ok = self.solid[s2i, s2j, s2k] == 0
+                                            if far_ok and blade_at(
+                                                xr + EX[q], yr + EY[q], k + EZ[q], th_b
+                                            ) == 0:
+                                                gk_new = (
+                                                    2.0 * qq * fj_here
+                                                    + (1.0 - 2.0 * qq)
+                                                    * src[s2i, s2j, s2k][jd]
+                                                    + term
+                                                )
+                                                used1 = 1
+                                        if used1 == 0:
+                                            # q > 1/2 branch; also the fallback for a
+                                            # missing second neighbour or a tie-zone
+                                            # miss (qq < 0), where q = 1/2 reduces it
+                                            # to exact halfway bounce-back.
+                                            qz = ti.max(qq, 0.5)
+                                            inv = 1.0 / (2.0 * qz)
+                                            gk_new = (
+                                                inv * fj_here
+                                                + (1.0 - inv) * src[i, j, k][q]
+                                                + inv * term
+                                            )
+                                        g[q] = gk_new
+
+                                        if ti.static(measure):
+                                            # Same link exchange as the solid-centric
+                                            # path, with the real (unshifted) in/out
+                                            # pair and the arm at the exact wall point.
+                                            dp = fj_here + gk_new + 2.0 * W[q]
+                                            diff = fj_here - gk_new
+                                            fxl = -EX[q] * dp - uwx * diff
+                                            fyl = -EY[q] * dp - uwy * diff
+                                            fzl = -EZ[q] * dp
+                                            self._link_force[None] += ti.Vector(
+                                                [fxl, fyl, fzl]
+                                            )
+                                            ax0 = self.axis[None][0]
+                                            ay0 = self.axis[None][1]
+                                            rxl = (i - ax0) + qq * EX_F[jd]
+                                            ryl = (j - ay0) + qq * EY_F[jd]
+                                            self._link_torque[None] += ti.Vector([
+                                                0.0, 0.0, rxl * fyl - ryl * fxl,
+                                            ])
 
                         # --- macroscopic. The +1 undoes the w_i shift: sum(f) = sum(g) + 1
                         # because the weights sum to one. Momentum needs no correction,

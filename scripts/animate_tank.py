@@ -26,14 +26,14 @@ import numpy as np
 from matplotlib.colors import PowerNorm
 
 from lms.viz.animate import contour_animation, pooled_norm
-from lms.viz.style import FLOW
+from lms.viz.style import EMBER
 
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("state", type=Path)
     p.add_argument("--fps", type=int, default=12)
-    p.add_argument("--dpi", type=int, default=92)
+    p.add_argument("--dpi", type=int, default=105)
     p.add_argument("--max-frames", type=int, default=120,
                    help="subsample to keep the GIF under the 5 MB budget")
     p.add_argument("--out", type=Path, default=None)
@@ -88,7 +88,11 @@ def main() -> None:
             title=title,
             subtitle=f"{n}³ tank   ·   Re = {float(d['reynolds']):,.0f}   ·   regularized + LES",
             norm=norm,
-            cmap=FLOW,
+            # EMBER, not FLOW: on the dark canvas a blue ramp's foot dissolves into
+            # the background. And the image renderer, not contours: a turbulent slice
+            # posterises into mush under 44 filled levels at GIF dpi.
+            cmap=EMBER,
+            renderer="image",
             n_filled=44,
             n_lines=0,
             solid=mask,
