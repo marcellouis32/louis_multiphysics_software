@@ -3,8 +3,17 @@
     python scripts/blend_time.py cases/examples/rushton_standard.yaml --n 96
 
 The dye-and-stopwatch experiment every process engineer has run, in silico. The tracer
-enters as the schema's top_patch, the tank stirs, and theta_95 is the moment the
-coefficient of variation over the fluid falls below 5%.
+enters as the schema's top_patch and the tank stirs. Two mixing-time definitions are
+reported, because the literature uses both and they differ by a factor of ~2 here:
+
+  * absolute:   CoV over the fluid falls below 5%
+  * reduction:  CoV falls to 5% of its INITIAL value (95% homogenisation)
+
+A top-patch injection starts at CoV ~ 2.9, so the reduction definition's target is
+CoV ~ 0.145 -- reachable long before the absolute 0.05. Correlations like Grenville
+were fitted to probe measurements that correspond more closely to the reduction
+reading; quoting only the absolute one against them would manufacture a factor-2
+"error" out of a units mismatch between definitions.
 
 The comparison target is `grenville_blend_time`, fed with *our own measured* power
 number from the same flow -- not the literature midpoint -- so the check stays
@@ -45,6 +54,9 @@ def main() -> None:
                    help="power number for the Grenville comparison; measured from "
                         "this flow if a prior run_case result is not supplied")
     p.add_argument("--frames-per-rev", type=int, default=5)
+    p.add_argument("--boundary", choices=["halfway", "bouzidi"], default="bouzidi",
+                   help="blade wall treatment; bouzidi is the Phase 2 default since "
+                        "the meter audit")
     p.add_argument("--out", type=Path, default=Path("runs/blend"))
     args = p.parse_args()
 
@@ -55,7 +67,8 @@ def main() -> None:
 
     scales = scales_from_case(case)
     tank = tank_from_case(case, scales)
-    solver = build_solver(case, scales, tank, prefer_gpu=True)
+    solver = build_solver(case, scales, tank, prefer_gpu=True,
+                          boundary=args.boundary)
     spr = scales.steps_per_revolution
 
     # Scalar rides the flow solver's own fields; blades are transparent to it (the
@@ -88,6 +101,8 @@ def main() -> None:
     mid_y = tank.shape[1] // 2
     history, frames_c, frames_u, frame_revs = [], [], [], []
     theta95_steps = None
+    reduction_steps = None
+    cov0 = None
     stop_at = None
 
     total = round(args.max_revs * spr)
@@ -113,9 +128,14 @@ def main() -> None:
             if step % (check_every * 10) == 0:
                 print(f"  rev {revs:6.1f}   CoV = {cov:.4f}   "
                       f"({time.perf_counter() - t0:,.0f}s)", flush=True)
+            if cov0 is None:
+                cov0 = cov
+            if reduction_steps is None and cov < 0.05 * cov0:
+                reduction_steps = step
+                print(f"  -> 95% homogenisation (CoV {0.05 * cov0:.3f}) at rev {revs:.2f}")
             if cov < 0.05 and theta95_steps is None:
                 theta95_steps = step
-                print(f"  -> CoV crossed 5% at rev {revs:.2f}")
+                print(f"  -> absolute CoV crossed 5% at rev {revs:.2f}")
                 # A few more frames so the animation ends on a mixed tank.
                 stop_at = step + round(3 * spr)
 
@@ -124,25 +144,32 @@ def main() -> None:
     # first blend attempt threw them away by exiting before the save.
     crossed = theta95_steps is not None
     theta95_s = theta95_steps * scales.dt_s if crossed else float("nan")
+    reduction_s = (reduction_steps * scales.dt_s
+                   if reduction_steps is not None else float("nan"))
     imp = case.primary_impeller
     np_used = args.np_measured or 4.11   # n=96 measured value from the Np ladder
     ref = grenville_blend_time(
         imp.speed_hz, np_used, imp.diameter_m, case.geometry.vessel.diameter_m
     )
+    print()
+    if reduction_steps is not None:
+        print(f"theta_95 (95% reduction) = {reduction_s:.2f} s "
+              f"({reduction_steps / spr:.1f} revs)   vs Grenville {ref:.2f} s   "
+              f"ratio {reduction_s / ref:.2f}")
     if crossed:
-        print(f"\ntheta_95 = {theta95_s:.2f} s  ({theta95_steps / spr:.1f} revolutions)")
-        print(f"Grenville (Np = {np_used:g}): {ref:.2f} s   ->   "
-              f"ratio {theta95_s / ref:.2f}  (target 0.7-1.3)")
-    else:
+        print(f"theta_95 (absolute 5%)   = {theta95_s:.2f} s "
+              f"({theta95_steps / spr:.1f} revs)")
+    if reduction_steps is None and not crossed:
         final_cov = history[-1][1]
-        print(f"\nCoV never reached 5% within {args.max_revs:g} revolutions "
+        print(f"neither definition reached within {args.max_revs:g} revolutions "
               f"(final CoV = {final_cov:.3f}). Saving diagnostics anyway.")
 
     args.out.mkdir(parents=True, exist_ok=True)
     path = args.out / f"blend_{case.name}_n{args.n}.npz"
     np.savez_compressed(
         path,
-        cov=np.array(history), theta95_s=theta95_s, grenville_s=ref,
+        cov=np.array(history), theta95_s=theta95_s, reduction_s=reduction_s,
+        grenville_s=ref,
         np_used=np_used, frames_c=np.array(frames_c), frames_u=np.array(frames_u),
         frame_revs=np.array(frame_revs), static_solid=tank.static_solid,
         steps_per_rev=spr, n=args.n, u_tip=scales.u_tip,
