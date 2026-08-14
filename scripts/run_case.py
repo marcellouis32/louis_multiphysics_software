@@ -32,7 +32,8 @@ from lms.schema.reference import REFERENCE_POWER_NUMBER
 
 def build_solver(case, scales, tank, prefer_gpu: bool = True,
                  cs_override: float | None = None,
-                 boundary: str = "halfway") -> D3Q19Solver:
+                 boundary: str = "halfway",
+                 collision: str = "regularized") -> D3Q19Solver:
     init_backend(prefer_gpu=prefer_gpu, precision="fp32" if prefer_gpu else "fp64")
 
     solid = tank.static_solid.astype(np.int32)
@@ -50,7 +51,7 @@ def build_solver(case, scales, tank, prefer_gpu: bool = True,
         tank.shape,
         omega=viscosity_to_omega(scales.nu),
         solid=solid,
-        collision="regularized",
+        collision=collision,
         smagorinsky=smagorinsky,
         rotor=tank.rotor_params(boundary=boundary),
     )
@@ -72,17 +73,24 @@ def main() -> None:
     p.add_argument("--mach", type=float, default=None, help="override lattice_mach")
     p.add_argument("--boundary", choices=["halfway", "bouzidi"], default="halfway",
                    help="blade wall treatment")
+    p.add_argument("--collision", choices=["bgk", "trt", "regularized"],
+                   default="regularized")
+    p.add_argument("--visc-scale", type=float, default=None,
+                   help="multiply fluid viscosity (drops Re) for operator comparisons "
+                        "at relaxation times where both operators survive")
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--out", type=Path, default=Path("runs/tank"))
     args = p.parse_args()
 
     case = load_case(args.case)
-    if args.n is not None or args.mach is not None:
+    if args.n is not None or args.mach is not None or args.visc_scale is not None:
         case = case.model_copy(deep=True)
         if args.n is not None:
             case.numerics.cells_across_tank = args.n
         if args.mach is not None:
             case.numerics.lattice_mach = args.mach
+        if args.visc_scale is not None:
+            case.fluid.viscosity_pa_s *= args.visc_scale
 
     scales = scales_from_case(case)
     tank = tank_from_case(case, scales)
@@ -92,7 +100,8 @@ def main() -> None:
         # not inferred across a ladder where t/D changes with every rung.
         tank.impeller["thickness"] = args.plate_cells
     solver = build_solver(case, scales, tank, prefer_gpu=not args.cpu,
-                          cs_override=args.cs, boundary=args.boundary)
+                          cs_override=args.cs, boundary=args.boundary,
+                          collision=args.collision)
 
     spr = scales.steps_per_revolution
     n_spin = round(args.spinup * spr)
@@ -176,6 +185,10 @@ def main() -> None:
         tag += f"_ma{args.mach:g}"
     if args.boundary != "halfway":
         tag += f"_{args.boundary}"
+    if args.collision != "regularized":
+        tag += f"_{args.collision}"
+    if args.visc_scale is not None:
+        tag += f"_v{args.visc_scale:g}"
     path = args.out / f"tank_{tag}.npz"
     vel = solver.vel.to_numpy()
     np.savez_compressed(
