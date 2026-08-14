@@ -781,19 +781,16 @@ class TestBouzidi:
             tank.rotor_params(boundary="ibm")
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason="KNOWN DEFECT, Phase 2 handoff: the Bouzidi torque meter reads ~3-6x the "
-    "angular momentum the fluid actually receives, while the halfway meter balances "
-    "to ~25%. The reconstruction itself is fine (bulk dL/dt matches halfway); the "
-    "bookkeeping is not. Closing it needs an instrumented momentum ledger: baffle and "
-    "vessel torque measured separately, and the fresh-node refill injection metered. "
-    "Np numbers from the bouzidi meter are NOT trustworthy until this passes.",
-)
 def test_bouzidi_meter_balances_angular_momentum():
-    """The meter must agree with an independent measurement: the rate of change of
-    the fluid's resolved angular momentum, in an early window before the jet reaches
-    the (unmetered) baffles."""
+    """The meter must agree with an independent measurement: the fluid's resolved
+    dL/dt in an early window. This was an xfail for one commit: the meter read 3-6x
+    reality until the momentum ledger localised the error to the +2W isotropic
+    pressure background, whose net torque on a closed body is exactly zero in the
+    continuum but whose staircase non-closure on a rotated blade's link set swamped
+    the physical signal ~10x per unpaired link. Dropping the gauge term closed the
+    halfway budget to 4% and the bouzidi budget to 17% at n = 48 (refill-injection
+    approximation plus two-link edge noise); the tolerance here carries margin over
+    the measured 17%."""
     from lms.geometry.tank import tank_from_case
     from lms.lbm.d2q9 import viscosity_to_omega
     from lms.lbm.solver3d import D3Q19Solver, init_backend
@@ -832,4 +829,4 @@ def test_bouzidi_meter_balances_angular_momentum():
         s.step()
     fluid_gain = (l_z() - l0) / 50
     meter = -s.drain_torque_log()[1:].mean()
-    assert meter == pytest.approx(fluid_gain, rel=0.5)
+    assert meter == pytest.approx(fluid_gain, rel=0.35)

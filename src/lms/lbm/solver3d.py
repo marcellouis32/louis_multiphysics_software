@@ -116,6 +116,7 @@ class D3Q19Solver:
         dtype=None,
         smagorinsky: float = 0.0,
         rotor: dict | None = None,
+        ledger: bool = False,
     ) -> None:
         """`rotor`, when given, adds a rotating blade set evaluated analytically in the
         kernel (see `Tank.rotor_params`). Keys: z_centre, blade_inner, blade_outer,
@@ -167,6 +168,21 @@ class D3Q19Solver:
         solid_int = solid.astype(np.int32)
         self.solid.from_numpy(solid_int)
         self.wall_vel.fill(0)
+
+        # The momentum ledger: cumulative meters for every channel of angular
+        # momentum into or out of the resolved fluid. Off by default -- it adds an
+        # exchange loop over ALL wall nodes -- and switched on for audits, where the
+        # question is not "what is the torque" but "does the budget close". Built
+        # because the Bouzidi torque meter read 3-6x the fluid's actual dL/dt and the
+        # only honest way to locate such a discrepancy is to meter every channel and
+        # let the residual point at what is missing.
+        self.ledger = bool(ledger)
+        self._led_static = ti.field(self.dtype, shape=())   # torque-z on class-1 walls
+        self._led_inject = ti.field(self.dtype, shape=())   # L_z injected by refills
+        self._led_remove = ti.field(self.dtype, shape=())   # L_z removed by coverage
+        self._led_static[None] = 0.0
+        self._led_inject[None] = 0.0
+        self._led_remove[None] = 0.0
 
         self._rotor = dict(rotor) if rotor is not None else None
         self.theta = 0.0
@@ -229,6 +245,7 @@ class D3Q19Solver:
         # Loose radial guards; correctness comes from the exact test inside them.
         rot_r2_lo = max(rot_in - 1.5, 0.0) ** 2
         rot_r2_hi = (rot_out + 1.5) ** 2
+        ledger_on = self.ledger
         is_bouzidi = has_rotor and rot.get("boundary") == "bouzidi"
         # Plain-python constants for the Bouzidi block: int()/float() inside a kernel
         # body are rewritten into runtime casts by Taichi's AST transformer, so numpy
@@ -493,6 +510,41 @@ class D3Q19Solver:
                         # compile-time (ti.static) and elides the whole block from
                         # kernels that measure nothing; folding it into a runtime
                         # conjunction would put the cost on every solid node forever.
+                        if ti.static(ledger_on):  # noqa: SIM102 -- static/runtime split
+                            # Ledger channel: class-1 walls (vessel, baffles, lid,
+                            # bottom). Same link exchange as the measured surfaces --
+                            # these are the silent absorbers the audit exists to hear.
+                            if self.solid[i, j, k] == 1:
+                                for q in ti.static(range(1, Q)):
+                                    lsi = (i - EX[q] + nx) % nx
+                                    lsj = (j - EY[q] + ny) % ny
+                                    lsk = (k - EZ[q] + nz) % nz
+                                    lnf = self.solid[lsi, lsj, lsk] == 0
+                                    if ti.static(has_rotor):  # noqa: SIM102
+                                        if lnf and blade_at(
+                                            xr - EX[q], yr - EY[q], k - EZ[q],
+                                            self._theta_now[None],
+                                        ) != 0:
+                                            lnf = False
+                                    if lnf:
+                                        leu = (EX[q] * uw[0] + EY[q] * uw[1]
+                                               + EZ[q] * uw[2])
+                                        ldp = 2.0 * g[q] - 6.0 * W[q] * leu
+                                        lfx = EX[q] * ldp
+                                        lfy = EY[q] * ldp
+                                        lrx = i - 0.5 * EX[q] - self.axis[None][0]
+                                        lry = j - 0.5 * EY[q] - self.axis[None][1]
+                                        self._led_static[None] += lrx * lfy - lry * lfx
+
+                            # Coverage is deliberately NOT a ledger channel. The
+                            # first audit metered it and the budget refused to close:
+                            # under halfway bounce-back a covered node returns its
+                            # gathered momentum to the fluid next step (a one-step
+                            # inventory, not a flux), and under Bouzidi the loss is
+                            # already inside the one-sided link meter, which counts
+                            # fj out with only the reconstructed gk back. Metering it
+                            # again double-books ~the entire impeller torque.
+
                         if ti.static(measure):  # noqa: SIM102
                             if self.solid[i, j, k] == 2 or (
                                 dyn != 0 and ti.static(not is_bouzidi)
@@ -514,7 +566,16 @@ class D3Q19Solver:
                                         # f_in = g[q] + w_q arrived along e_q; the
                                         # bounced partner leaves along -e_q as
                                         # b[OPP[q]] + w_q = g[q] - 6 w_q eu + w_q.
-                                        dp = 2.0 * g[q] + 2.0 * W[q] - 6.0 * W[q] * eu
+                                        # No +2W term: that is the isotropic pressure
+                                        # background, whose net force/torque on a
+                                        # closed body is exactly zero in the continuum.
+                                        # On a staircase link set it does not cancel
+                                        # exactly, and per link it is ~100x the
+                                        # physical signal -- the ledger measured a
+                                        # rotated blade's background non-closure at
+                                        # several times the true torque. Dropping it
+                                        # removes pure gauge, no physics.
+                                        dp = 2.0 * g[q] - 6.0 * W[q] * eu
                                         # Galilean correction for a MOVING wall (Wen
                                         # et al. 2014): the naive e (f_in + f_out)
                                         # exchange is derived in the wall's rest
@@ -555,7 +616,19 @@ class D3Q19Solver:
                             # the diagnostic is free.
                             if blade_at(xr, yr, k, self._theta_prev[None]) != 0:
                                 uwf = ti.Vector([-rot_omega * yr, rot_omega * xr, 0.0])
-                                g = feq_shifted(1.0, uwf)
+                                gnew = feq_shifted(1.0, uwf)
+                                if ti.static(ledger_on):
+                                    # Ledger channel: refill injection. Setting the
+                                    # node to equilibrium replaces whatever streamed
+                                    # in -- momentum created from nothing, as far as
+                                    # the resolved fluid is concerned.
+                                    dpx = 0.0
+                                    dpy = 0.0
+                                    for q in ti.static(range(Q)):
+                                        dpx += EX[q] * (gnew[q] - g[q])
+                                        dpy += EY[q] * (gnew[q] - g[q])
+                                    self._led_inject[None] += xr * dpy - yr * dpx
+                                g = gnew
                                 fresh = 1
 
                         if ti.static(is_bouzidi):
@@ -634,7 +707,9 @@ class D3Q19Solver:
                                             # Same link exchange as the solid-centric
                                             # path, with the real (unshifted) in/out
                                             # pair and the arm at the exact wall point.
-                                            dp = fj_here + gk_new + 2.0 * W[q]
+                                            # Isotropic background dropped; see the
+                                            # solid-centric meter's comment.
+                                            dp = fj_here + gk_new
                                             diff = fj_here - gk_new
                                             fxl = -EX[q] * dp - uwx * diff
                                             fyl = -EY[q] * dp - uwy * diff
@@ -876,6 +951,32 @@ class D3Q19Solver:
                 self.theta += self._rotor["omega"]
         self._steps[self._parity]()
         self._parity ^= 1
+
+    def reset_ledger(self) -> None:
+        self._led_static[None] = 0.0
+        self._led_inject[None] = 0.0
+        self._led_remove[None] = 0.0
+
+    def ledger_report(self) -> dict:
+        """Cumulative ledger channels since the last reset. Requires ledger=True."""
+        if not self.ledger:
+            raise RuntimeError("construct the solver with ledger=True to audit")
+        return {
+            "static_torque_z": float(self._led_static[None]),
+            "inject_Lz": float(self._led_inject[None]),
+            "remove_Lz": float(self._led_remove[None]),
+        }
+
+    def angular_momentum_z(self) -> float:
+        """Resolved fluid angular momentum about the set axis, from the fields."""
+        rho = self.rho.to_numpy()
+        vel = self.vel.to_numpy()
+        nx, ny, _ = self.shape
+        ax = float(self.axis[None][0]) if hasattr(self, "axis") else (nx - 1) / 2.0
+        ay = float(self.axis[None][1]) if hasattr(self, "axis") else (ny - 1) / 2.0
+        x = np.arange(nx)[:, None, None] - ax
+        y = np.arange(ny)[None, :, None] - ay
+        return float((rho * (x * vel[..., 1] - y * vel[..., 0])).sum())
 
     def drain_torque_log(self) -> np.ndarray:
         """Torque-z history accumulated on the device since the last drain.
