@@ -417,6 +417,14 @@ Phase 2 is geometry: STL voxelisation, an immersed boundary, a rotating impeller
 Rushton power number within ~10% of the published 4.8–5.5. Everything in it is about
 putting objects into a flow that now works.
 
+> **What actually happened** — see [phase2.md](phase2.md). The tank proved fully
+> parametric, so neither STL nor IBM was built; the rotating impeller runs as an
+> analytic in-kernel solid with Bouzidi sub-cell walls. The power number came out on
+> the published curve at Re 50 and 500 but 28% below the band at Re 5×10⁴ — a miss
+> anatomised down to one remaining suspect (trailing-vortex resolution, band near
+> n ≈ 1000) through eleven eliminated hypotheses and a momentum-ledger audit that
+> caught a real torque-meter bug along the way.
+
 ---
 
 ## Reproducing
